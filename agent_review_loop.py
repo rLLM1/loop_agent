@@ -1,0 +1,1782 @@
+#!/usr/bin/env python3
+"""Run a resumable implement-review-fix loop with Claude Code and Codex."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
+
+
+APP_DIR = Path(__file__).resolve().parent
+DEFAULT_RUN_LOG_DIR = APP_DIR / "run_logs"
+STATE_VERSION = 1
+
+AGENT1_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["question", "conclusion"]},
+        "message": {"type": "string"},
+        "commit_message": {"type": "string"},
+        "target_branch": {"type": "string"},
+        "work_branch": {"type": "string"},
+        "review_base": {"type": "string"},
+        "review_head": {"type": "string"},
+    },
+    "required": ["status", "message", "commit_message"],
+    "additionalProperties": False,
+}
+
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["issues", "clean"]},
+        "summary": {"type": "string"},
+        "issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {
+                        "type": "string",
+                        "enum": ["critical", "high", "medium", "low"],
+                    },
+                    "title": {"type": "string"},
+                    "details": {"type": "string"},
+                },
+                "required": ["severity", "title", "details"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["status", "summary", "issues"],
+    "additionalProperties": False,
+}
+
+AGENT1_SYSTEM = """\
+You are agent 1, the implementing coding agent. Work directly in the current
+repository. Investigate, edit, and test as needed. Do not commit or push; the
+orchestrator owns commits.
+
+Return exactly the requested JSON object:
+- status="question" only when user input is genuinely required before work can
+  continue. Put the question and useful context in message.
+- status="conclusion" when the current work is complete. Put a concise summary
+  and test results in message, and provide a meaningful imperative git commit
+  subject in commit_message.
+- If you create or switch branches, include target_branch, work_branch,
+  review_base, and review_head when known. review_base must be the commit Agent
+  2 should diff from, not a stale branch from a previous task.
+
+When responding to reviewer feedback, assess every issue independently. Fix all
+issues you agree with and explain any disagreements in message. Do not make
+unrelated changes.
+
+Keep message compact: at most 10 bullets, no full diffs, no long logs, no file
+dumps. Include changed files, key decisions, tests run, and blockers only.
+"""
+
+
+class OrchestrationError(RuntimeError):
+    """Raised for an invalid response or unsafe repository state."""
+
+
+@dataclass
+class Agent1Reply:
+    status: str
+    message: str
+    commit_message: str
+    target_branch: str = ""
+    work_branch: str = ""
+    review_base: str = ""
+    review_head: str = ""
+
+
+@dataclass
+class ReviewReply:
+    status: str
+    summary: str
+    issues: List[Dict[str, str]]
+
+
+@dataclass
+class WorkItem:
+    item_id: str
+    title: str
+    text: str
+    checked: bool
+    status: str = "pending"
+    task_base_commit: str = ""
+    last_commit: str = ""
+    review_round: int = 1
+    summary: str = ""
+
+
+@dataclass
+class RunState:
+    version: int
+    run_id: str
+    repo: str
+    prompt: str
+    problems_file: Optional[str]
+    problems_text: str
+    base_commit: str
+    baseline_untracked: List[str]
+    agent1_session_id: str
+    agent1_started: bool = False
+    phase: str = "agent_initial"
+    agent_mode: str = "initial"
+    pending_prompt: str = ""
+    reply: Optional[Dict[str, str]] = None
+    review: Optional[Dict[str, Any]] = None
+    commit: Optional[str] = None
+    review_base: Optional[str] = None
+    review_head: Optional[str] = None
+    target_branch: Optional[str] = None
+    work_branch: Optional[str] = None
+    prior_context: str = ""
+    review_round: int = 1
+    status_message: str = ""
+    run_key: Optional[str] = None
+    work_queue: bool = False
+    work_item_id: Optional[str] = None
+    work_item_title: Optional[str] = None
+    work_item_text: Optional[str] = None
+    tasks: List[Dict[str, Any]] = None
+    current_task_index: int = -1
+    queue_base_commit: Optional[str] = None
+    final_review: bool = False
+    agent1_session_mode: str = "fresh"
+    state_summary: str = ""
+
+    @classmethod
+    def from_dict(cls, value: Dict[str, Any]) -> "RunState":
+        if value.get("version") != STATE_VERSION:
+            raise OrchestrationError(
+                f"unsupported state version {value.get('version')!r}"
+            )
+        try:
+            return cls(**value)
+        except TypeError as exc:
+            raise OrchestrationError(f"invalid run state: {exc}") from exc
+
+
+class StateStore:
+    def __init__(
+        self,
+        root: Path = DEFAULT_RUN_LOG_DIR / "state",
+        *,
+        run_key: Optional[str] = None,
+    ) -> None:
+        self.root = root
+        self.run_key = run_key
+
+    def path_for(self, run_id: str) -> Path:
+        return self.root / f"{run_id}.json"
+
+    def key_path_for(self, run_key: str) -> Path:
+        return self.root / "by_key" / f"{_slugify(run_key)}.json"
+
+    def save(self, state: RunState) -> Path:
+        self.root.mkdir(parents=True, exist_ok=True)
+        path = self.path_for(state.run_id)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(asdict(state), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+        key = state.run_key or self.run_key
+        if key:
+            key_path = self.key_path_for(key)
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            key_tmp = key_path.with_suffix(".json.tmp")
+            key_tmp.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            key_tmp.replace(key_path)
+        return path
+
+    def load(self, identifier: str) -> RunState:
+        candidate = Path(identifier).expanduser()
+        path = candidate if candidate.exists() else self.path_for(identifier)
+        if not path.exists():
+            raise OrchestrationError(f"run state not found: {identifier}")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OrchestrationError(f"could not read run state {path}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise OrchestrationError(f"run state must be a JSON object: {path}")
+        return RunState.from_dict(value)
+
+    def load_latest_incomplete(self) -> RunState:
+        if not self.root.exists():
+            raise OrchestrationError("no saved runs found")
+        paths = sorted(
+            self.root.glob("*.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for path in paths:
+            state = self.load(str(path))
+            if state.phase not in {"complete", "max_rounds", "review_blocked"}:
+                return state
+        raise OrchestrationError("no incomplete saved runs found")
+
+    def load_by_key(self, run_key: str) -> RunState:
+        return self.load(str(self.key_path_for(run_key)))
+
+    def has_key(self, run_key: str) -> bool:
+        return self.key_path_for(run_key).exists()
+
+
+class MemoryStateStore:
+    """State-store-compatible test helper that performs no filesystem writes."""
+
+    def save(self, state: RunState) -> None:
+        return None
+
+
+class RunLog:
+    """Write one concise Markdown transcript for each program invocation."""
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        state: RunState,
+        resumed: bool,
+    ) -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        self.path = root / f"{timestamp}_{state.run_id[:8]}.md"
+        started = datetime.now(timezone.utc).isoformat()
+        header = "# Agent Review Loop\n\n" f"- Run ID: `{state.run_id}`\n"
+        if state.run_key:
+            header += f"- Run key: `{state.run_key}`\n"
+        header += (
+            f"- Started: `{started}`\n"
+            f"- Repository: `{state.repo}`\n"
+            f"- Invocation: `{'resume' if resumed else 'new'}`\n\n"
+            "## User Request\n\n"
+            f"{state.prompt}\n"
+        )
+        self.path.write_text(header, encoding="utf-8")
+        if state.work_queue and state.work_item_text:
+            self.add(
+                "Selected Work Item",
+                f"ID: `{state.work_item_id}`\n\n{state.work_item_text}",
+            )
+        if state.problems_text and not state.work_queue:
+            source = state.problems_file or "provided document"
+            self.add("Problem List", f"Source: `{source}`\n\n{state.problems_text}")
+        elif state.problems_file:
+            self.add("Problem File", f"Source: `{state.problems_file}`")
+        if resumed and state.phase == "awaiting_user" and state.reply:
+            self.add("Pending Agent 1 Question", state.reply.get("message", ""))
+
+    def add(self, title: str, text: str) -> None:
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n## {title}\n\n{text.strip() or '(empty)'}\n")
+
+    def finish(self, text: str) -> None:
+        self.add("Exit", text)
+
+
+class NullRunLog:
+    path = Path("")
+
+    def add(self, title: str, text: str) -> None:
+        return None
+
+    def finish(self, text: str) -> None:
+        return None
+
+
+def _slugify(value: str, *, default: str = "run", max_length: int = 48) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-._")
+    if not slug:
+        slug = default
+    return slug[:max_length].strip("-._") or default
+
+
+def _run_label(state: RunState) -> str:
+    if state.run_key:
+        return _slugify(state.run_key, default="run-key")
+    if state.problems_file:
+        return _slugify(Path(state.problems_file).stem, default="problems")
+    return _slugify(state.prompt, default="prompt")
+
+
+def _terminal_phase(phase: str) -> bool:
+    return phase in {"complete", "max_rounds", "review_blocked"}
+
+
+def _prompt_stats(prompt: str) -> Dict[str, int]:
+    return {"chars": len(prompt), "est_tokens": (len(prompt) + 3) // 4}
+
+
+def _parse_work_items(markdown: str) -> List[WorkItem]:
+    items: List[WorkItem] = []
+    current: Optional[Dict[str, Any]] = None
+    checkbox_re = re.compile(r"^\s*[-*]\s+\[([ xX])\]\s+(.+?)\s*$")
+
+    def flush() -> None:
+        nonlocal current
+        if current is None:
+            return
+        body = "\n".join(current["lines"]).rstrip()
+        text = current["title"] if not body else f"{current['title']}\n{body}"
+        item_id = _slugify(current["title"], max_length=80)
+        items.append(
+            WorkItem(
+                item_id=item_id,
+                title=current["title"],
+                text=text,
+                checked=current["checked"],
+            )
+        )
+        current = None
+
+    for line in markdown.splitlines():
+        match = checkbox_re.match(line)
+        if match:
+            flush()
+            current = {
+                "checked": match.group(1).lower() == "x",
+                "title": match.group(2).strip(),
+                "lines": [],
+            }
+            continue
+        if current is not None:
+            current["lines"].append(line)
+    flush()
+    return items
+
+
+class QueueProgressStore:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def path_for(self, run_key: str) -> Path:
+        return self.root / "queues" / f"{_slugify(run_key)}.json"
+
+    def load(self, run_key: str) -> Dict[str, Any]:
+        path = self.path_for(run_key)
+        if not path.exists():
+            return {"done": {}}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise OrchestrationError(f"could not read queue state {path}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise OrchestrationError(f"queue state must be a JSON object: {path}")
+        value.setdefault("done", {})
+        if not isinstance(value["done"], dict):
+            raise OrchestrationError(f"queue state field 'done' must be an object: {path}")
+        return value
+
+    def mark_done(self, run_key: str, state: RunState) -> Path:
+        if not state.work_item_id:
+            raise OrchestrationError("cannot mark queue item done: state has no item id")
+        value = self.load(run_key)
+        value["done"][state.work_item_id] = {
+            "title": state.work_item_title or state.work_item_id,
+            "commit": state.commit,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        path = self.path_for(run_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        return path
+
+
+def _select_next_work_item(
+    *,
+    problems_text: str,
+    queue_progress: Dict[str, Any],
+) -> Optional[WorkItem]:
+    done = set(queue_progress.get("done", {}).keys())
+    for item in _parse_work_items(problems_text):
+        if not item.checked and item.item_id not in done:
+            return item
+    return None
+
+
+def _work_item_to_task(item: WorkItem) -> Dict[str, Any]:
+    return {
+        "id": item.item_id,
+        "title": item.title,
+        "text": item.text,
+        "checked": item.checked,
+        "status": "done" if item.checked else "pending",
+        "task_base_commit": "",
+        "last_commit": "",
+        "review_round": 1,
+        "summary": "",
+    }
+
+
+def _task_to_work_item(task: Dict[str, Any]) -> WorkItem:
+    return WorkItem(
+        item_id=str(task.get("id") or _slugify(str(task.get("title", "task")))),
+        title=str(task.get("title") or task.get("id") or "task"),
+        text=str(task.get("text") or task.get("title") or ""),
+        checked=bool(task.get("checked") or task.get("status") == "done"),
+        status=str(task.get("status") or "pending"),
+        task_base_commit=str(task.get("task_base_commit") or ""),
+        last_commit=str(task.get("last_commit") or ""),
+        review_round=int(task.get("review_round") or 1),
+        summary=str(task.get("summary") or ""),
+    )
+
+
+def _parse_task_queue(problems_text: str) -> List[Dict[str, Any]]:
+    tasks = [_work_item_to_task(item) for item in _parse_work_items(problems_text)]
+    if not tasks:
+        raise OrchestrationError("work queue has no checkbox tasks")
+    return tasks
+
+
+def _current_task(state: RunState) -> Optional[Dict[str, Any]]:
+    if not state.tasks or state.current_task_index < 0:
+        return None
+    if state.current_task_index >= len(state.tasks):
+        return None
+    return state.tasks[state.current_task_index]
+
+
+def _select_next_task_index(state: RunState) -> Optional[int]:
+    for index, task in enumerate(state.tasks or []):
+        if task.get("status") not in {"done", "skipped"}:
+            return index
+    return None
+
+
+def _task_block(task: Dict[str, Any]) -> str:
+    return (
+        f"- id: {task.get('id')}\n"
+        f"- title: {task.get('title')}\n\n"
+        f"{task.get('text', '').strip()}"
+    ).strip()
+
+
+def _compact_state_summary(state: RunState) -> str:
+    done = [
+        str(t.get("id") or t.get("title"))
+        for t in (state.tasks or [])
+        if t.get("status") == "done"
+    ]
+    current = _current_task(state)
+    parts = []
+    if done:
+        parts.append("Completed tasks: " + ", ".join(done[-8:]))
+    if current:
+        parts.append(
+            f"Current task: {current.get('id')} ({current.get('status', 'pending')})"
+        )
+        if current.get("last_commit"):
+            parts.append(f"Current task last commit: {current.get('last_commit')}")
+    if state.state_summary:
+        parts.append(state.state_summary)
+    return "\n".join(parts) if parts else "(no prior task summary)"
+
+
+def _task_prompt(state: RunState, *, review_text: str = "") -> str:
+    task = _current_task(state)
+    if task is None:
+        raise OrchestrationError("no current task selected")
+    source = state.problems_file or "provided problem file"
+    mode = "fix the Codex review findings" if review_text else "implement the task"
+    extra = (
+        "\n\nCodex review findings to address:\n"
+        f"{review_text}"
+        if review_text
+        else ""
+    )
+    return (
+        f"{state.prompt}\n\n"
+        f"WORK QUEUE MODE: {mode}.\n"
+        "Process exactly the current task. Do not start later tasks. Keep the "
+        "diff limited to this task.\n"
+        "Do not commit or push; the orchestrator owns commits.\n"
+        "Return compact JSON only. message <= 10 bullets; no full diffs or long logs.\n\n"
+        f"Problem file path: {source}\n\n"
+        "Current task:\n"
+        f"{_task_block(task)}\n\n"
+        "Compact state summary:\n"
+        f"{_compact_state_summary(state)}"
+        f"{extra}"
+    )
+
+
+def _work_queue_prompt(prompt: str, item: WorkItem, problems_file: Optional[Path]) -> str:
+    source = str(problems_file.expanduser().resolve()) if problems_file else "the problem file"
+    return (
+        f"{prompt}\n\n"
+        "WORK QUEUE MODE\n"
+        "Process exactly one work-queue item in this program run.\n"
+        "Do not start later items. Keep the diff limited to this item.\n"
+        "Commit exactly this item as one focused commit; the orchestrator owns the commit.\n"
+        "After Agent 2 review is clean, stop. If this item has an unresolved "
+        "precondition, return a question or blocked conclusion instead of guessing.\n\n"
+        f"Problem file: {source}\n\n"
+        f"Selected item id: {item.item_id}\n"
+        f"Selected item:\n{item.text}"
+    )
+
+
+class RunLock:
+    def __init__(self, path: Path, *, break_lock: bool = False) -> None:
+        self.path = path
+        self.break_lock = break_lock
+        self.acquired = False
+
+    def __enter__(self) -> "RunLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.break_lock and self.path.exists():
+            self.path.unlink()
+        payload = (
+            f"pid={os.getpid()}\n"
+            f"started={datetime.now(timezone.utc).isoformat()}\n"
+        )
+        try:
+            fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError as exc:
+            existing = ""
+            try:
+                existing = self.path.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+            raise OrchestrationError(
+                f"run lock already exists: {self.path}"
+                + (f" ({existing})" if existing else "")
+                + ". Use --break-lock only if the previous process is gone."
+            ) from exc
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        self.acquired = True
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.acquired:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _run(
+    command: Sequence[str],
+    *,
+    cwd: Path,
+    input_text: Optional[str] = None,
+    raw_log_path: Optional[Path] = None,
+    heartbeat_seconds: float = 0,
+    timeout_seconds: Optional[float] = None,
+    heartbeat_label: str = "command",
+) -> subprocess.CompletedProcess[str]:
+    if raw_log_path is None and heartbeat_seconds <= 0 and timeout_seconds is None:
+        try:
+            return subprocess.run(
+                list(command),
+                cwd=cwd,
+                input=input_text,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as exc:
+            raise OrchestrationError(
+                f"could not execute {command[0]!r}: {exc}"
+            ) from exc
+
+    stdout_parts: List[str] = []
+    stderr_parts: List[str] = []
+    raw_handle = None
+    raw_lock = threading.Lock()
+    if raw_log_path is not None:
+        raw_log_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_handle = raw_log_path.open("a", encoding="utf-8")
+        raw_handle.write(
+            f"# Raw subprocess log\n"
+            f"started: {datetime.now(timezone.utc).isoformat()}\n"
+            f"label: {heartbeat_label}\n"
+            f"cwd: {cwd}\n\n"
+        )
+        raw_handle.flush()
+
+    def read_stream(stream: Any, sink: List[str], stream_name: str) -> None:
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                sink.append(chunk)
+                if raw_handle is not None:
+                    with raw_lock:
+                        raw_handle.write(f"\n[{stream_name}]\n{chunk}")
+                        raw_handle.flush()
+        finally:
+            stream.close()
+
+    try:
+        process = subprocess.Popen(
+            list(command),
+            cwd=cwd,
+            text=True,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        if raw_handle is not None:
+            raw_handle.close()
+        raise OrchestrationError(
+            f"could not execute {command[0]!r}: {exc}"
+        ) from exc
+
+    if input_text is not None and process.stdin is not None:
+        try:
+            process.stdin.write(input_text)
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
+
+    stdout_thread = threading.Thread(
+        target=read_stream,
+        args=(process.stdout, stdout_parts, "stdout"),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=read_stream,
+        args=(process.stderr, stderr_parts, "stderr"),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    started = time.monotonic()
+    next_heartbeat = started + heartbeat_seconds if heartbeat_seconds > 0 else None
+    try:
+        while process.poll() is None:
+            now = time.monotonic()
+            elapsed = now - started
+            if timeout_seconds is not None and elapsed >= timeout_seconds:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise OrchestrationError(
+                    f"{heartbeat_label} timed out after {timeout_seconds / 60:.1f} "
+                    "minutes"
+                )
+            if next_heartbeat is not None and now >= next_heartbeat:
+                raw_hint = f" Raw log: {raw_log_path}" if raw_log_path else ""
+                print(
+                    f"[orchestrator] Waiting for {heartbeat_label}... "
+                    f"{elapsed / 60:.1f} minutes elapsed.{raw_hint}",
+                    flush=True,
+                )
+                next_heartbeat = now + heartbeat_seconds
+            time.sleep(0.2)
+    finally:
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+        if raw_handle is not None:
+            with raw_lock:
+                raw_handle.write(
+                    f"\nfinished: {datetime.now(timezone.utc).isoformat()}\n"
+                    f"exit_code: {process.returncode}\n"
+                )
+            raw_handle.close()
+
+    return subprocess.CompletedProcess(
+        list(command),
+        process.returncode,
+        "".join(stdout_parts),
+        "".join(stderr_parts),
+    )
+
+
+def _extract_json_object(raw: str) -> Dict[str, Any]:
+    text = raw.strip()
+    if not text:
+        raise OrchestrationError("agent returned an empty response")
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise OrchestrationError(
+            f"agent did not return valid JSON: {text[:500]}"
+        ) from exc
+
+    if isinstance(value, dict):
+        for key in ("structured_output", "output"):
+            nested = value.get(key)
+            if isinstance(nested, dict):
+                return nested
+        result = value.get("result")
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            try:
+                nested = json.loads(result)
+            except json.JSONDecodeError:
+                nested = None
+            if isinstance(nested, dict):
+                return nested
+        return value
+    raise OrchestrationError("agent JSON response must be an object")
+
+
+def _require_fields(
+    value: Dict[str, Any],
+    *,
+    status_values: Set[str],
+    text_fields: Iterable[str],
+) -> None:
+    if value.get("status") not in status_values:
+        raise OrchestrationError(
+            f"invalid agent status {value.get('status')!r}; "
+            f"expected one of {sorted(status_values)}"
+        )
+    for field_name in text_fields:
+        if not isinstance(value.get(field_name), str):
+            raise OrchestrationError(
+                f"agent field {field_name!r} must be a string"
+            )
+
+
+def _agent1_reply_from_value(value: Dict[str, Any]) -> Agent1Reply:
+    _require_fields(
+        value,
+        status_values={"question", "conclusion"},
+        text_fields={"message", "commit_message"},
+    )
+    return Agent1Reply(
+        status=value["status"],
+        message=value["message"],
+        commit_message=value["commit_message"],
+        target_branch=value.get("target_branch") or "",
+        work_branch=value.get("work_branch") or "",
+        review_base=value.get("review_base") or "",
+        review_head=value.get("review_head") or "",
+    )
+
+
+class ClaudeAgent:
+    def __init__(
+        self,
+        *,
+        executable: str,
+        repo: Path,
+        model: Optional[str],
+        permission_mode: str,
+        raw_log_dir: Optional[Path] = None,
+        raw_log_label: str = "run",
+        heartbeat_seconds: float = 0,
+        timeout_seconds: Optional[float] = None,
+        session_id: Optional[str] = None,
+        started: bool = False,
+        session_mode: str = "fresh",
+    ) -> None:
+        self.executable = executable
+        self.repo = repo
+        self.model = model
+        self.permission_mode = permission_mode
+        self.raw_log_dir = raw_log_dir
+        self.raw_log_label = _slugify(raw_log_label)
+        self.heartbeat_seconds = heartbeat_seconds
+        self.timeout_seconds = timeout_seconds
+        self.session_id = session_id or str(uuid.uuid4())
+        self.started = started
+        self.session_mode = session_mode
+        self.call_count = 0
+
+    def ask(self, prompt: str) -> Agent1Reply:
+        self.call_count += 1
+        if self.session_mode == "fresh":
+            self.session_id = str(uuid.uuid4())
+            self.started = False
+        stats = _prompt_stats(prompt)
+        print(
+            "[orchestrator] Agent1 prompt: "
+            f"chars={stats['chars']} est_tokens={stats['est_tokens']} "
+            f"session={self.session_mode}",
+            flush=True,
+        )
+        schema = json.dumps(AGENT1_SCHEMA, separators=(",", ":"))
+        try:
+            return self._ask_once(prompt, schema, retry=False)
+        except OrchestrationError as first_error:
+            first_error_text = str(first_error)
+            if (
+                first_error_text.startswith("Claude Code failed")
+                or first_error_text.startswith("could not execute")
+                or " timed out after " in first_error_text
+            ):
+                raise
+            correction = (
+                "Your previous response was not valid for the orchestrator. "
+                "Return only one JSON object matching the required schema. "
+                "Do not include Markdown or prose outside JSON. Required fields: "
+                'status ("question" or "conclusion"), message, commit_message. '
+                "Optional fields: target_branch, work_branch, review_base, "
+                "review_head.\n\n"
+                f"Original parser error: {first_error}"
+            )
+            try:
+                return self._ask_once(correction, schema, retry=True)
+            except OrchestrationError as second_error:
+                raise OrchestrationError(
+                    "Agent 1 did not return valid JSON after one retry. "
+                    f"First error: {first_error}; retry error: {second_error}"
+                ) from second_error
+
+    def _ask_once(self, prompt: str, schema: str, *, retry: bool) -> Agent1Reply:
+        command = [
+            self.executable,
+            "--print",
+            "--output-format",
+            "json",
+            "--json-schema",
+            schema,
+            "--permission-mode",
+            self.permission_mode,
+        ]
+        if self.model:
+            command.extend(["--model", self.model])
+        if self.started or retry:
+            command.extend(["--resume", self.session_id])
+        else:
+            command.extend([
+                "--session-id",
+                self.session_id,
+                "--append-system-prompt",
+                AGENT1_SYSTEM,
+            ])
+        command.append(prompt)
+
+        raw_log_path = None
+        if self.raw_log_dir is not None:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            suffix = "retry" if retry else f"{self.call_count:03d}"
+            raw_log_path = (
+                self.raw_log_dir
+                / (
+                    f"{stamp}_{self.raw_log_label}_{self.session_id[:8]}"
+                    f"_agent1_{suffix}.log"
+                )
+            )
+        result = _run(
+            command,
+            cwd=self.repo,
+            raw_log_path=raw_log_path,
+            heartbeat_seconds=self.heartbeat_seconds,
+            timeout_seconds=self.timeout_seconds,
+            heartbeat_label=(
+                f"agent 1 call {self.call_count}"
+                + (" JSON retry" if retry else "")
+            ),
+        )
+        if result.returncode != 0:
+            raise OrchestrationError(
+                "Claude Code failed "
+                f"(exit {result.returncode}): {result.stderr.strip()}"
+            )
+        self.started = True
+        return _agent1_reply_from_value(_extract_json_object(result.stdout))
+
+
+class CodexReviewer:
+    def __init__(
+        self,
+        *,
+        executable: str,
+        repo: Path,
+        model: Optional[str],
+        raw_log_dir: Optional[Path] = None,
+        raw_log_label: str = "run",
+        heartbeat_seconds: float = 0,
+        timeout_seconds: Optional[float] = None,
+    ) -> None:
+        self.executable = executable
+        self.repo = repo
+        self.model = model
+        self.raw_log_dir = raw_log_dir
+        self.raw_log_label = _slugify(raw_log_label)
+        self.heartbeat_seconds = heartbeat_seconds
+        self.timeout_seconds = timeout_seconds
+        self.call_count = 0
+
+    def review(
+        self,
+        *,
+        base_commit: str,
+        commit: str,
+        agent1_conclusion: str,
+        prior_context: str = "",
+    ) -> ReviewReply:
+        self.call_count += 1
+        prompt = f"""\
+Review the cumulative code changes in {base_commit}..{commit} in the current
+repository. Recheck the full range on every round, not only the latest fix
+commit. Review only: do not edit files, commit, or run destructive commands.
+
+Prior implementing-agent conclusion:
+{agent1_conclusion}
+
+Prior review/disagreement context, if any:
+{prior_context or "(none)"}
+
+Look for correctness bugs, regressions, unsafe behavior, missing validation,
+compatibility problems, and important missing tests.
+
+Review on two levels:
+
+1. Big-picture fit:
+   - Does this diff address the user's actual request and the problem document?
+   - Is this diff necessary and useful for the stated goal?
+   - Did agent 1 solve the right problem, or only make a locally plausible edit?
+   - For docs, plans, runbooks, and migrations, is the result concrete enough
+     to execute, or still too high-level?
+   - Did agent 1 inspect the relevant code, docs, data, or generated artifacts
+     needed to justify the change?
+
+2. Diff correctness:
+   - Look for correctness bugs, regressions, unsafe behavior, missing
+     validation, compatibility problems, stale docs, contradictory
+     instructions, unsupported claims, missing tests, and execution hazards.
+   - For documentation or planning changes, check for vague rows, missing
+     file-level detail, contradictions with nearby sections, commands that
+     would fail, and claims not supported by available repo evidence.
+
+Report only actionable findings. Do not limit findings to lines changed in the
+latest diff if the user's request requires reviewing the whole affected
+artifact. If no issue remains, return status="clean" with an empty issues array.
+"""
+        with tempfile.TemporaryDirectory(prefix="agent-review-") as tmp:
+            tmp_path = Path(tmp)
+            schema_path = tmp_path / "review_schema.json"
+            output_path = tmp_path / "review.json"
+            schema_path.write_text(json.dumps(REVIEW_SCHEMA), encoding="utf-8")
+            command = [
+                self.executable,
+                "exec",
+                "--sandbox",
+                "read-only",
+                "--cd",
+                str(self.repo),
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+            ]
+            if self.model:
+                command.extend(["--model", self.model])
+            command.append(prompt)
+            raw_log_path = None
+            if self.raw_log_dir is not None:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                raw_log_path = (
+                    self.raw_log_dir
+                    / (
+                        f"{stamp}_{self.raw_log_label}"
+                        f"_agent2_review_{self.call_count:03d}.log"
+                    )
+                )
+            result = _run(
+                command,
+                cwd=self.repo,
+                raw_log_path=raw_log_path,
+                heartbeat_seconds=self.heartbeat_seconds,
+                timeout_seconds=self.timeout_seconds,
+                heartbeat_label=f"agent 2 review {self.call_count}",
+            )
+            if result.returncode != 0:
+                raise OrchestrationError(
+                    f"Codex review failed (exit {result.returncode}): "
+                    f"{result.stderr.strip()}"
+                )
+            raw = output_path.read_text() if output_path.exists() else result.stdout
+
+        value = _extract_json_object(raw)
+        _require_fields(
+            value,
+            status_values={"issues", "clean"},
+            text_fields={"summary"},
+        )
+        issues = value.get("issues")
+        if not isinstance(issues, list):
+            raise OrchestrationError("review field 'issues' must be a list")
+        if value["status"] == "clean" and issues:
+            raise OrchestrationError("clean review must have an empty issues list")
+        return ReviewReply(
+            status=value["status"],
+            summary=value["summary"],
+            issues=issues,
+        )
+
+
+def _git(repo: Path, *args: str) -> str:
+    result = _run(["git", *args], cwd=repo)
+    if result.returncode != 0:
+        raise OrchestrationError(
+            f"git {' '.join(args)} failed: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def _tracked_dirty_paths(repo: Path) -> Set[str]:
+    paths = set(_git(repo, "diff", "--name-only").splitlines())
+    paths.update(_git(repo, "diff", "--cached", "--name-only").splitlines())
+    return {path for path in paths if path}
+
+
+def _untracked_paths(repo: Path) -> Set[str]:
+    output = _git(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    return {path for path in output.split("\0") if path}
+
+
+def _changed_by_agent(repo: Path, baseline_untracked: Set[str]) -> Set[str]:
+    paths = _tracked_dirty_paths(repo)
+    paths.update(_untracked_paths(repo) - baseline_untracked)
+    return paths
+
+
+def _commit_agent_changes(
+    repo: Path,
+    *,
+    baseline_untracked: Set[str],
+    message: str,
+) -> Optional[str]:
+    paths = sorted(_changed_by_agent(repo, baseline_untracked))
+    if not paths:
+        return None
+    subject = " ".join(message.strip().split()) or "Implement agent changes"
+    _git(repo, "add", "--", *paths)
+    _git(repo, "commit", "-m", subject)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _format_review(review: ReviewReply) -> str:
+    lines = [review.summary]
+    for index, issue in enumerate(review.issues, 1):
+        lines.append(
+            f"{index}. [{issue.get('severity', 'unknown')}] "
+            f"{issue.get('title', '')}: {issue.get('details', '')}"
+        )
+    return "\n".join(lines)
+
+
+_BLOCKED_REVIEW_PATTERNS = (
+    "unable to perform the requested repository review",
+    "could not inspect the repository",
+    "cannot inspect the repository",
+    "can't inspect the repository",
+    "could not inspect the repo",
+    "cannot inspect the repo",
+    "can't inspect the repo",
+    "no repository evidence",
+    "no repo evidence",
+    "all commands rejected",
+    "all available shell commands are rejected",
+    "could not run git diff",
+    "cannot run git diff",
+    "can't run git diff",
+)
+
+_ACTIONABLE_REVIEW_HINTS = (
+    ".py:",
+    ".md:",
+    ".toml:",
+    ".yaml:",
+    ".yml:",
+    ".json:",
+    ".rs:",
+    ".go:",
+    ".ts:",
+    ".tsx:",
+    ".js:",
+    ".jsx:",
+    "add a regression test",
+    "add tests",
+    "fix ",
+    "narrow this check",
+    "either ",
+)
+
+
+def _review_is_blocked(review: ReviewReply) -> bool:
+    if review.status != "issues" or not review.issues:
+        return False
+    text = " ".join(
+        [review.summary]
+        + [
+            f"{issue.get('title', '')} {issue.get('details', '')}"
+            for issue in review.issues
+        ]
+    ).lower()
+    # A reviewer may include a test caveat such as "I could not run pytest
+    # because the session is read-only" while still giving concrete repo
+    # findings. That is not a blocked review; only stop when the review itself
+    # says repo inspection failed.
+    if any(hint in text for hint in _ACTIONABLE_REVIEW_HINTS):
+        return False
+    return any(pattern in text for pattern in _BLOCKED_REVIEW_PATTERNS)
+
+
+def _resolve_review_base(repo: Path, reply: Agent1Reply, fallback: str) -> str:
+    candidate = reply.review_base or fallback
+    try:
+        return _git(repo, "rev-parse", candidate)
+    except OrchestrationError as exc:
+        raise OrchestrationError(
+            f"Agent 1 provided invalid review base {candidate!r}: {exc}"
+        ) from exc
+
+
+def _resolve_review_head(repo: Path, reply: Agent1Reply, fallback: str) -> str:
+    candidate = reply.review_head or fallback
+    try:
+        return _git(repo, "rev-parse", candidate)
+    except OrchestrationError as exc:
+        raise OrchestrationError(
+            f"Agent 1 provided invalid review head {candidate!r}: {exc}"
+        ) from exc
+
+
+def _validate_review_range(repo: Path, base: str, head: str) -> None:
+    try:
+        _git(repo, "merge-base", "--is-ancestor", base, head)
+    except OrchestrationError as exc:
+        raise OrchestrationError(
+            f"review_base {base[:12]} is not an ancestor of "
+            f"review_head {head[:12]}"
+        ) from exc
+
+
+def _combined_prompt(prompt: str, problems_file: Optional[Path]) -> tuple[str, str]:
+    if problems_file is None:
+        return prompt, ""
+    resolved = problems_file.expanduser().resolve()
+    try:
+        problems_text = resolved.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise OrchestrationError(
+            f"could not read problems document {problems_file}: {exc}"
+        ) from exc
+    if not problems_text:
+        raise OrchestrationError("problems document is empty")
+    combined = (
+        f"{prompt}\n\n"
+        "Use the supplied problem document as task context, but do not copy it "
+        "into your response. Read only the relevant sections needed for the "
+        "current request.\n\n"
+        f"Problem file: {resolved}"
+    )
+    return combined, problems_text
+
+
+def _new_state(
+    *,
+    repo: Path,
+    prompt: str,
+    problems_file: Optional[Path],
+    run_key: Optional[str] = None,
+    work_queue: bool = False,
+    work_item: Optional[WorkItem] = None,
+) -> RunState:
+    if _tracked_dirty_paths(repo):
+        raise OrchestrationError(
+            "tracked files are already modified; commit or stash them before "
+            "running the agent loop"
+        )
+    combined, problems_text = _combined_prompt(prompt, problems_file)
+    tasks: List[Dict[str, Any]] = []
+    current_task_index = -1
+    queue_base_commit = None
+    if work_queue:
+        if not problems_text:
+            raise OrchestrationError("work queue mode needs a problems document")
+        tasks = _parse_task_queue(problems_text)
+        if work_item is not None:
+            wanted = work_item.item_id
+            current_task_index = next(
+                (i for i, task in enumerate(tasks) if task.get("id") == wanted),
+                -1,
+            )
+        if current_task_index < 0:
+            current_task_index = next(
+                (i for i, task in enumerate(tasks) if task.get("status") != "done"),
+                -1,
+            )
+        if current_task_index < 0:
+            raise OrchestrationError("work queue has no unchecked items")
+        tasks[current_task_index]["status"] = "running"
+        tasks[current_task_index]["task_base_commit"] = _git(repo, "rev-parse", "HEAD")
+        work_item = _task_to_work_item(tasks[current_task_index])
+        queue_base_commit = _git(repo, "rev-parse", "HEAD")
+        # In queue mode the state and prompts carry only the selected task, not
+        # the full problem document. The parsed compact task list is the durable
+        # queue state.
+        problems_text = ""
+        combined = ""
+    return RunState(
+        version=STATE_VERSION,
+        run_id=str(uuid.uuid4()),
+        repo=str(repo),
+        prompt=prompt,
+        problems_file=(
+            str(problems_file.expanduser().resolve()) if problems_file else None
+        ),
+        problems_text=problems_text,
+        base_commit=_git(repo, "rev-parse", "HEAD"),
+        baseline_untracked=sorted(_untracked_paths(repo)),
+        agent1_session_id=str(uuid.uuid4()),
+        pending_prompt=combined,
+        run_key=run_key,
+        work_queue=work_queue,
+        work_item_id=work_item.item_id if work_item else None,
+        work_item_title=work_item.title if work_item else None,
+        work_item_text=work_item.text if work_item else None,
+        tasks=tasks,
+        current_task_index=current_task_index,
+        queue_base_commit=queue_base_commit,
+    )
+
+
+def _reply_from_state(state: RunState) -> Agent1Reply:
+    if state.reply is None:
+        raise OrchestrationError("saved state is missing agent 1's conclusion")
+    return Agent1Reply(**state.reply)
+
+
+def _review_from_state(state: RunState) -> ReviewReply:
+    if state.review is None:
+        raise OrchestrationError("saved state is missing agent 2's review")
+    return ReviewReply(**state.review)
+
+
+def _validate_resume(repo: Path, state: RunState) -> None:
+    if repo != Path(state.repo):
+        raise OrchestrationError(
+            f"saved run belongs to {state.repo}, not {repo}"
+        )
+    expected = state.commit or state.base_commit
+    head = _git(repo, "rev-parse", "HEAD")
+    if head != expected:
+        raise OrchestrationError(
+            "repository HEAD changed since the saved checkpoint: "
+            f"expected {expected}, found {head}"
+        )
+    if state.phase in {"agent_initial", "agent_fix"} and _tracked_dirty_paths(repo):
+        raise OrchestrationError(
+            "resume stopped: tracked files are modified while the saved phase "
+            "is waiting to call Agent 1. This usually means the previous Claude "
+            "call edited files but did not return structured JSON. Inspect the "
+            "working tree before resuming."
+        )
+
+
+def run_state_loop(
+    *,
+    state: RunState,
+    state_store: Any,
+    run_log: Any,
+    agent1: Any,
+    reviewer: Any,
+    max_rounds: int,
+    input_fn: Callable[[str], str] = input,
+) -> int:
+    repo = Path(state.repo)
+    baseline_untracked = set(state.baseline_untracked)
+
+    while True:
+        if state.phase in {"complete", "max_rounds", "review_blocked"}:
+            message = state.status_message or "Nothing to do; run already finished."
+            print(f"\n[orchestrator] {message}", flush=True)
+            return 0 if state.phase == "complete" else 2
+
+        if state.phase in {"agent_initial", "agent_fix"}:
+            if state.work_queue:
+                if _current_task(state) is None:
+                    next_index = _select_next_task_index(state)
+                    if next_index is None:
+                        state.phase = "complete"
+                        state.status_message = "All work-queue tasks are complete."
+                        state_store.save(state)
+                        return 0
+                    state.current_task_index = next_index
+                    task = state.tasks[next_index]
+                    task["status"] = "running"
+                    task["task_base_commit"] = _git(repo, "rev-parse", "HEAD")
+                if not state.pending_prompt:
+                    state.pending_prompt = _task_prompt(state)
+            # Persist resume intent before the external call. If interrupted,
+            # the next invocation resumes the same Claude session and prompt.
+            was_started = state.agent1_started
+            state.agent1_started = True
+            state_store.save(state)
+            try:
+                reply = agent1.ask(state.pending_prompt)
+            except OrchestrationError:
+                # A normal CLI error means no usable response was created.
+                # Preserve resume intent only for process interruption.
+                state.agent1_started = getattr(agent1, "started", was_started)
+                state_store.save(state)
+                raise
+            state.reply = asdict(reply)
+            run_log.add("Agent 1", reply.message)
+            print("\n[agent 1]\n" + reply.message, flush=True)
+            if reply.status == "question":
+                state.phase = "awaiting_user"
+            else:
+                state.phase = "commit"
+            state_store.save(state)
+            continue
+
+        if state.phase == "awaiting_user":
+            question = _reply_from_state(state).message
+            answer = input_fn("\nYour response: ")
+            run_log.add("User Response", answer)
+            state.pending_prompt = (
+                "The user answered your question:\n\n"
+                f"{answer}\n\nContinue the task."
+            )
+            state.phase = "agent_initial" if state.agent_mode == "initial" else "agent_fix"
+            state_store.save(state)
+            continue
+
+        if state.phase == "commit":
+            reply = _reply_from_state(state)
+            new_commit = _commit_agent_changes(
+                repo,
+                baseline_untracked=baseline_untracked,
+                message=reply.commit_message,
+            )
+            if new_commit is None:
+                if state.commit is None:
+                    state.commit = _git(repo, "rev-parse", "HEAD")
+                message = "Agent 1 made no file changes."
+            else:
+                state.commit = new_commit
+                message = f"Committed `{new_commit[:12]}`: {reply.commit_message}"
+            task = _current_task(state) if state.work_queue else None
+            if task is not None and state.commit:
+                task["last_commit"] = state.commit
+                task["summary"] = reply.message
+            review_base = _resolve_review_base(
+                repo,
+                reply,
+                (task.get("task_base_commit") if task else None)
+                or state.review_base
+                or state.base_commit,
+            )
+            review_head = _resolve_review_head(
+                repo,
+                reply,
+                state.commit or state.base_commit,
+            )
+            _validate_review_range(repo, review_base, review_head)
+            state.review_base = review_base
+            state.review_head = review_head
+            state.target_branch = reply.target_branch or state.target_branch
+            state.work_branch = reply.work_branch or state.work_branch
+            print(f"\n[orchestrator] {message}", flush=True)
+            run_log.add("Commit", message)
+
+            if state.agent_mode == "fix":
+                review_text = _format_review(_review_from_state(state))
+                state.prior_context = (
+                    f"Agent 2 previously reported:\n{review_text}\n\n"
+                    f"Agent 1 responded:\n{reply.message}"
+                )
+                state.review_round += 1
+            state.phase = "review"
+            state_store.save(state)
+            continue
+
+        if state.phase == "review":
+            if state.review_round > max_rounds:
+                state.phase = "max_rounds"
+                state.status_message = (
+                    f"Stopped after {max_rounds} review rounds with unresolved "
+                    "findings."
+                )
+                state_store.save(state)
+                run_log.add("Result", state.status_message)
+                return 2
+
+            reply = _reply_from_state(state)
+            review = reviewer.review(
+                base_commit=state.review_base or state.base_commit,
+                commit=state.review_head or state.commit or state.base_commit,
+                agent1_conclusion=reply.message,
+                prior_context=state.prior_context,
+            )
+            state.review = asdict(review)
+            review_text = _format_review(review)
+            title = f"Agent 2 Review {state.review_round}"
+            run_log.add(title, review_text)
+            print(f"\n[{title.lower()}]\n{review_text}", flush=True)
+            if review.status == "clean":
+                if state.work_queue:
+                    task = _current_task(state)
+                    if task is not None:
+                        task["status"] = "done"
+                        task["review_round"] = state.review_round
+                        task["summary"] = _reply_from_state(state).message
+                    next_index = _select_next_task_index(state)
+                    if next_index is not None:
+                        state.current_task_index = next_index
+                        next_task = state.tasks[next_index]
+                        next_task["status"] = "running"
+                        next_task["task_base_commit"] = _git(repo, "rev-parse", "HEAD")
+                        next_task["review_round"] = 1
+                        state.work_item_id = str(next_task.get("id"))
+                        state.work_item_title = str(next_task.get("title"))
+                        state.work_item_text = str(next_task.get("text"))
+                        state.agent_mode = "initial"
+                        state.phase = "agent_initial"
+                        state.reply = None
+                        state.review = None
+                        state.prior_context = ""
+                        state.review_round = 1
+                        state.review_base = None
+                        state.review_head = None
+                        state.pending_prompt = _task_prompt(state)
+                        state.status_message = (
+                            f"Task {task.get('id') if task else ''} clean; "
+                            f"starting {next_task.get('id')}."
+                        )
+                        state_store.save(state)
+                        run_log.add("Result", state.status_message)
+                        continue
+                    state.phase = "complete"
+                    state.status_message = "All work-queue tasks are complete."
+                else:
+                    state.phase = "complete"
+                    state.status_message = "Agent 2 found no remaining issues."
+                state_store.save(state)
+                run_log.add("Result", state.status_message)
+                return 0
+            if _review_is_blocked(review):
+                state.phase = "review_blocked"
+                state.status_message = (
+                    "Agent 2 review blocked by its execution environment; "
+                    "not sending the blocker back to Agent 1 as a code issue."
+                )
+                state_store.save(state)
+                run_log.add("Result", state.status_message)
+                return 2
+
+            state.agent_mode = "fix"
+            state.pending_prompt = (
+                _task_prompt(state, review_text=review_text)
+                if state.work_queue
+                else (
+                    "Agent 2 reviewed your latest committed work. Assess every "
+                    "finding, fix all findings you agree with, test the result, "
+                    "and explain any disagreements. Do not commit.\n\n"
+                    f"{review_text}"
+                )
+            )
+            state.phase = "agent_fix"
+            state_store.save(state)
+            continue
+
+        raise OrchestrationError(f"unknown saved phase: {state.phase}")
+
+
+def run_loop(
+    *,
+    repo: Path,
+    initial_prompt: str,
+    agent1: Any,
+    reviewer: Any,
+    max_rounds: int,
+    input_fn: Callable[[str], str] = input,
+) -> int:
+    """Compatibility wrapper used by callers that do not need persistence."""
+    state = _new_state(repo=repo, prompt=initial_prompt, problems_file=None)
+    return run_state_loop(
+        state=state,
+        state_store=MemoryStateStore(),
+        run_log=NullRunLog(),
+        agent1=agent1,
+        reviewer=reviewer,
+        max_rounds=max_rounds,
+        input_fn=input_fn,
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("prompt", nargs="?", help="Initial request for agent 1")
+    parser.add_argument(
+        "--problems-file",
+        type=Path,
+        help="Document containing an additional list of problems to address",
+    )
+    parser.add_argument(
+        "--repo",
+        type=Path,
+        help="Git repository to modify (default: current directory)",
+    )
+    parser.add_argument(
+        "--work-queue",
+        action="store_true",
+        help="Process exactly one unchecked checkbox item from --problems-file",
+    )
+    parser.add_argument(
+        "--run-key",
+        help="Stable key for same-command resume and work-queue progress",
+    )
+    parser.add_argument(
+        "--new-run",
+        action="store_true",
+        help="Start a fresh keyed run instead of resuming an existing run",
+    )
+    parser.add_argument(
+        "--break-lock",
+        action="store_true",
+        help="Break a stale --run-key lock before starting",
+    )
+    resume = parser.add_mutually_exclusive_group()
+    resume.add_argument(
+        "--resume",
+        metavar="RUN_ID_OR_STATE_PATH",
+        help="Resume a saved run by ID or state JSON path",
+    )
+    resume.add_argument(
+        "--resume-last",
+        action="store_true",
+        help="Resume the most recently saved incomplete run",
+    )
+    parser.add_argument("--agent1-command", default="claude")
+    parser.add_argument("--agent2-command", default="codex")
+    parser.add_argument("--agent1-model")
+    parser.add_argument("--agent2-model")
+    parser.add_argument(
+        "--agent1-permission-mode",
+        choices=["acceptEdits", "auto", "bypassPermissions", "dontAsk"],
+        default="acceptEdits",
+        help="Claude Code permission mode (default: acceptEdits)",
+    )
+    parser.add_argument(
+        "--agent1-session-mode",
+        choices=["fresh", "resume"],
+        default="fresh",
+        help="Use fresh Claude sessions per call or legacy resumed sessions",
+    )
+    parser.add_argument("--max-rounds", type=int, default=10)
+    parser.add_argument(
+        "--heartbeat-seconds",
+        type=float,
+        default=30,
+        help="Print a waiting heartbeat this often for Claude/Codex calls",
+    )
+    parser.add_argument(
+        "--agent-timeout-minutes",
+        type=float,
+        default=60,
+        help="Abort an individual Claude/Codex call after this many minutes",
+    )
+    parser.add_argument(
+        "--run-log-dir",
+        type=Path,
+        default=DEFAULT_RUN_LOG_DIR,
+        help=argparse.SUPPRESS,
+    )
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = _build_parser().parse_args(argv)
+    if args.max_rounds <= 0:
+        raise SystemExit("--max-rounds must be positive")
+    if args.heartbeat_seconds < 0:
+        raise SystemExit("--heartbeat-seconds must be non-negative")
+    if args.agent_timeout_minutes <= 0:
+        raise SystemExit("--agent-timeout-minutes must be positive")
+    if args.work_queue and not args.problems_file:
+        raise SystemExit("--work-queue requires --problems-file")
+    if args.work_queue and not args.run_key:
+        raise SystemExit("--work-queue requires --run-key")
+    if args.new_run and not args.run_key:
+        raise SystemExit("--new-run requires --run-key")
+    if args.break_lock and not args.run_key:
+        raise SystemExit("--break-lock requires --run-key")
+
+    log_root = args.run_log_dir.expanduser().resolve()
+    raw_log_dir = log_root / "raw"
+    state_store = StateStore(log_root / "state", run_key=args.run_key)
+    resumed = bool(args.resume or args.resume_last)
+    lock = (
+        RunLock(
+            log_root / "state" / "by_key" / f"{_slugify(args.run_key)}.lock",
+            break_lock=args.break_lock,
+        )
+        if args.run_key
+        else None
+    )
+    try:
+        if lock is not None:
+            lock.__enter__()
+        if args.resume:
+            if args.prompt or args.problems_file:
+                raise OrchestrationError(
+                    "a resumed run cannot accept a new prompt or problems file"
+                )
+            state = state_store.load(args.resume)
+        elif args.resume_last:
+            if args.prompt or args.problems_file:
+                raise OrchestrationError(
+                    "a resumed run cannot accept a new prompt or problems file"
+                )
+            state = state_store.load_latest_incomplete()
+        else:
+            prompt = args.prompt
+            if not prompt:
+                prompt = input("Task for agent 1: ").strip()
+            if not prompt:
+                raise OrchestrationError("a non-empty prompt is required")
+            repo = (args.repo or Path.cwd()).expanduser().resolve()
+            if not (repo / ".git").exists():
+                raise OrchestrationError(f"not a git repository: {repo}")
+            problems_path = (
+                args.problems_file.expanduser().resolve()
+                if args.problems_file
+                else None
+            )
+            if args.run_key and state_store.has_key(args.run_key) and not args.new_run:
+                existing = state_store.load_by_key(args.run_key)
+                if not _terminal_phase(existing.phase):
+                    if existing.prompt != prompt:
+                        raise OrchestrationError(
+                            "existing incomplete keyed run uses a different prompt; "
+                            "use the same command, --resume, --new-run, or a new --run-key"
+                        )
+                    if existing.problems_file != (str(problems_path) if problems_path else None):
+                        raise OrchestrationError(
+                            "existing incomplete keyed run uses a different problems file; "
+                            "use the same command, --resume, --new-run, or a new --run-key"
+                        )
+                    state = existing
+                    resumed = True
+                elif args.work_queue:
+                    print(
+                        f"[orchestrator] Work queue `{args.run_key}` is complete. "
+                        "Use --new-run to start over.",
+                        flush=True,
+                    )
+                    return 0
+                else:
+                    raise OrchestrationError(
+                        f"run key {args.run_key!r} already finished; use "
+                        "--new-run to start over"
+                    )
+            else:
+                state = _new_state(
+                    repo=repo,
+                    prompt=prompt,
+                    problems_file=problems_path,
+                    run_key=args.run_key,
+                    work_queue=args.work_queue,
+                )
+                state_store.save(state)
+
+        repo = Path(state.repo)
+        if args.repo and args.repo.expanduser().resolve() != repo:
+            raise OrchestrationError(
+                f"--repo does not match saved run repository {repo}"
+            )
+        if resumed:
+            _validate_resume(repo, state)
+        for executable in (args.agent1_command, args.agent2_command):
+            if shutil.which(executable) is None:
+                raise OrchestrationError(
+                    f"required executable not found: {executable}"
+                )
+
+        run_log = RunLog(root=log_root, state=state, resumed=resumed)
+        print(f"[orchestrator] Run log: {run_log.path}", flush=True)
+        raw_log_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[orchestrator] Raw logs: {raw_log_dir}", flush=True)
+        raw_log_label = _run_label(state)
+        run_log.add(
+            "Raw Logs",
+            f"Raw Claude/Codex subprocess logs are written to `{raw_log_dir}`.\n"
+            f"Raw log filename label: `{raw_log_label}`.\n"
+            "Use `tail -f` on the current file for live progress.",
+        )
+        agent1 = ClaudeAgent(
+            executable=args.agent1_command,
+            repo=repo,
+            model=args.agent1_model,
+            permission_mode=args.agent1_permission_mode,
+            raw_log_dir=raw_log_dir,
+            raw_log_label=raw_log_label,
+            heartbeat_seconds=args.heartbeat_seconds,
+            timeout_seconds=args.agent_timeout_minutes * 60,
+            session_id=state.agent1_session_id,
+            started=state.agent1_started,
+            session_mode=args.agent1_session_mode,
+        )
+        reviewer = CodexReviewer(
+            executable=args.agent2_command,
+            repo=repo,
+            model=args.agent2_model,
+            raw_log_dir=raw_log_dir,
+            raw_log_label=raw_log_label,
+            heartbeat_seconds=args.heartbeat_seconds,
+            timeout_seconds=args.agent_timeout_minutes * 60,
+        )
+        try:
+            result = run_state_loop(
+                state=state,
+                state_store=state_store,
+                run_log=run_log,
+                agent1=agent1,
+                reviewer=reviewer,
+                max_rounds=args.max_rounds,
+            )
+        except KeyboardInterrupt:
+            state_store.save(state)
+            run_log.finish("Interrupted. The saved run can be resumed safely.")
+            print("\nInterrupted; run state saved.", file=sys.stderr)
+            return 130
+        except OrchestrationError as exc:
+            state_store.save(state)
+            run_log.finish(f"Error: {exc}")
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        run_log.finish(state.status_message or "Nothing to do.")
+        return result
+    except OrchestrationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if lock is not None:
+            lock.__exit__(None, None, None)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

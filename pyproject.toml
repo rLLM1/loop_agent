@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loop_agent"
+version = "0.1.0"
+description = "Token-bounded Claude/Codex implement-review loop orchestrator"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.scripts]
+loop-agent = "agent_review_loop:main"
+
+[tool.setuptools]
+py-modules = ["agent_review_loop"]
+
