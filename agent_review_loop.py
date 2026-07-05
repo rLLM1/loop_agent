@@ -466,6 +466,62 @@ def _select_next_task_index(state: RunState) -> Optional[int]:
     return None
 
 
+def _start_work_queue_task(state: RunState, repo: Path, index: int) -> None:
+    state.current_task_index = index
+    task = state.tasks[index]
+    task["status"] = "running"
+    task["task_base_commit"] = _git(repo, "rev-parse", "HEAD")
+    task["review_round"] = 1
+    task["last_commit"] = ""
+    state.work_item_id = str(task.get("id"))
+    state.work_item_title = str(task.get("title"))
+    state.work_item_text = str(task.get("text"))
+    state.agent_mode = "initial"
+    state.phase = "agent_initial"
+    state.reply = None
+    state.review = None
+    state.prior_context = ""
+    state.review_round = 1
+    state.review_base = None
+    state.review_head = None
+    state.pending_prompt = _task_prompt(state)
+
+
+def _skip_current_work_queue_task(
+    *,
+    state: RunState,
+    repo: Path,
+    run_log: Any,
+    reason: str,
+) -> None:
+    task = _current_task(state)
+    if task is None:
+        raise OrchestrationError("cannot skip work-queue task: no current task")
+    if _tracked_dirty_paths(repo):
+        raise OrchestrationError(
+            "cannot skip current task because tracked files are modified; "
+            "inspect the working tree before continuing"
+        )
+    task_base = str(task.get("task_base_commit") or "")
+    if not task_base:
+        raise OrchestrationError(
+            "cannot skip current task because task_base_commit is missing"
+        )
+    _git(repo, "reset", "--hard", task_base)
+    task["status"] = "skipped"
+    task["review_round"] = state.review_round
+    task["summary"] = reason
+    task_id = str(task.get("id") or task.get("title") or "current task")
+    message = f"[USER TODO] {task_id} skipped: {reason}"
+    state.state_summary = (
+        f"{state.state_summary}\n{message}".strip()
+        if state.state_summary
+        else message
+    )
+    state.commit = _git(repo, "rev-parse", "HEAD")
+    run_log.add("Task Skipped", message)
+
+
 def _task_block(task: Dict[str, Any]) -> str:
     return (
         f"- id: {task.get('id')}\n"
@@ -1303,10 +1359,12 @@ def run_state_loop(
     agent1: Any,
     reviewer: Any,
     max_rounds: int,
+    max_dispute_rounds: Optional[int] = None,
     input_fn: Callable[[str], str] = input,
 ) -> int:
     repo = Path(state.repo)
     baseline_untracked = set(state.baseline_untracked)
+    dispute_limit = max_dispute_rounds or max_rounds
 
     while True:
         if state.phase in {"complete", "max_rounds", "review_blocked"}:
@@ -1323,10 +1381,7 @@ def run_state_loop(
                         state.status_message = "All work-queue tasks are complete."
                         state_store.save(state)
                         return 0
-                    state.current_task_index = next_index
-                    task = state.tasks[next_index]
-                    task["status"] = "running"
-                    task["task_base_commit"] = _git(repo, "rev-parse", "HEAD")
+                    _start_work_queue_task(state, repo, next_index)
                 if not state.pending_prompt:
                     state.pending_prompt = _task_prompt(state)
             # Persist resume intent before the external call. If interrupted,
@@ -1414,7 +1469,40 @@ def run_state_loop(
             continue
 
         if state.phase == "review":
-            if state.review_round > max_rounds:
+            round_limit = dispute_limit if state.work_queue else max_rounds
+            if state.review_round > round_limit:
+                if state.work_queue:
+                    task = _current_task(state)
+                    reason = (
+                        f"Agent A and Agent B still have unresolved findings "
+                        f"after {round_limit} review/dispute rounds. Dropped "
+                        "this task's branch changes and moving to the next task."
+                    )
+                    _skip_current_work_queue_task(
+                        state=state,
+                        repo=repo,
+                        run_log=run_log,
+                        reason=reason,
+                    )
+                    next_index = _select_next_task_index(state)
+                    if next_index is not None:
+                        skipped_id = task.get("id") if task else ""
+                        _start_work_queue_task(state, repo, next_index)
+                        state.status_message = (
+                            f"Task {skipped_id} skipped after dispute limit; "
+                            f"starting {state.tasks[next_index].get('id')}."
+                        )
+                        state_store.save(state)
+                        run_log.add("Result", state.status_message)
+                        continue
+                    state.phase = "complete"
+                    state.status_message = (
+                        "All work-queue tasks are complete; at least one task "
+                        "was skipped with [USER TODO] follow-up."
+                    )
+                    state_store.save(state)
+                    run_log.add("Result", state.status_message)
+                    return 0
                 state.phase = "max_rounds"
                 state.status_message = (
                     f"Stopped after {max_rounds} review rounds with unresolved "
@@ -1445,26 +1533,10 @@ def run_state_loop(
                         task["summary"] = _reply_from_state(state).message
                     next_index = _select_next_task_index(state)
                     if next_index is not None:
-                        state.current_task_index = next_index
-                        next_task = state.tasks[next_index]
-                        next_task["status"] = "running"
-                        next_task["task_base_commit"] = _git(repo, "rev-parse", "HEAD")
-                        next_task["review_round"] = 1
-                        state.work_item_id = str(next_task.get("id"))
-                        state.work_item_title = str(next_task.get("title"))
-                        state.work_item_text = str(next_task.get("text"))
-                        state.agent_mode = "initial"
-                        state.phase = "agent_initial"
-                        state.reply = None
-                        state.review = None
-                        state.prior_context = ""
-                        state.review_round = 1
-                        state.review_base = None
-                        state.review_head = None
-                        state.pending_prompt = _task_prompt(state)
+                        _start_work_queue_task(state, repo, next_index)
                         state.status_message = (
                             f"Task {task.get('id') if task else ''} clean; "
-                            f"starting {next_task.get('id')}."
+                            f"starting {state.tasks[next_index].get('id')}."
                         )
                         state_store.save(state)
                         run_log.add("Result", state.status_message)
@@ -1512,6 +1584,7 @@ def run_loop(
     agent1: Any,
     reviewer: Any,
     max_rounds: int,
+    max_dispute_rounds: Optional[int] = None,
     input_fn: Callable[[str], str] = input,
 ) -> int:
     """Compatibility wrapper used by callers that do not need persistence."""
@@ -1523,6 +1596,7 @@ def run_loop(
         agent1=agent1,
         reviewer=reviewer,
         max_rounds=max_rounds,
+        max_dispute_rounds=max_dispute_rounds,
         input_fn=input_fn,
     )
 
@@ -1588,6 +1662,15 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-rounds", type=int, default=10)
     parser.add_argument(
+        "--max-dispute-rounds",
+        type=int,
+        default=5,
+        help=(
+            "In work-queue mode, skip the current task after this many "
+            "unresolved Agent A/B review rounds and continue to the next task"
+        ),
+    )
+    parser.add_argument(
         "--heartbeat-seconds",
         type=float,
         default=30,
@@ -1612,6 +1695,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.max_rounds <= 0:
         raise SystemExit("--max-rounds must be positive")
+    if args.max_dispute_rounds <= 0:
+        raise SystemExit("--max-dispute-rounds must be positive")
     if args.heartbeat_seconds < 0:
         raise SystemExit("--heartbeat-seconds must be non-negative")
     if args.agent_timeout_minutes <= 0:
@@ -1757,6 +1842,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 agent1=agent1,
                 reviewer=reviewer,
                 max_rounds=args.max_rounds,
+                max_dispute_rounds=args.max_dispute_rounds,
             )
         except KeyboardInterrupt:
             state_store.save(state)

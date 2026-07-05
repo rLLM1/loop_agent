@@ -534,6 +534,104 @@ def test_work_queue_main_processes_all_items_in_one_invocation(repo: Path, tmp_p
     assert state["phase"] == "complete"
 
 
+def test_work_queue_skips_task_after_dispute_limit_and_continues(
+    repo: Path,
+    tmp_path: Path,
+):
+    queue = tmp_path / "queue.md"
+    queue.write_text(
+        "- [ ] U0: disputed\n"
+        "  This item will not converge.\n"
+        "- [ ] U1: clean\n"
+        "  This item should still run.\n"
+    )
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="skip-test",
+        work_queue=True,
+    )
+    class CapturingStateStore:
+        def __init__(self):
+            self.saved = None
+
+        def save(self, value):
+            self.saved = value
+
+        def load(self, _run_id):
+            return self.saved
+
+    store = CapturingStateStore()
+    store.save(state)
+
+    class CapturingRunLog:
+        def __init__(self):
+            self.entries = []
+
+        def add(self, title, text):
+            self.entries.append((title, text))
+
+    class FakeAgent:
+        def ask(self, prompt):
+            if "U0: disputed" in prompt:
+                (repo / "tracked.txt").write_text("bad-u0\n")
+                return agent_loop.Agent1Reply(
+                    "conclusion",
+                    "Implemented U0 but review will not converge.",
+                    "Implement U0",
+                )
+            (repo / "tracked.txt").write_text("good-u1\n")
+            return agent_loop.Agent1Reply(
+                "conclusion",
+                "Implemented U1.",
+                "Implement U1",
+            )
+
+    class DisputedThenCleanReviewer:
+        def __init__(self):
+            self.calls = 0
+
+        def review(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return agent_loop.ReviewReply(
+                    "issues",
+                    "Still disputed.",
+                    [{
+                        "severity": "high",
+                        "title": "Unresolved correctness issue",
+                        "details": "tracked.txt:1 still contains the bad U0 value.",
+                    }],
+                )
+            return agent_loop.ReviewReply("clean", "No issues.", [])
+
+    run_log = CapturingRunLog()
+    reviewer = DisputedThenCleanReviewer()
+    result = agent_loop.run_state_loop(
+        state=state,
+        state_store=store,
+        run_log=run_log,
+        agent1=FakeAgent(),
+        reviewer=reviewer,
+        max_rounds=10,
+        max_dispute_rounds=1,
+    )
+
+    saved = store.load(state.run_id)
+    assert result == 0
+    assert [task["status"] for task in saved.tasks] == ["skipped", "done"]
+    assert "[USER TODO]" in saved.state_summary
+    assert "U0-disputed skipped" in saved.state_summary
+    assert (repo / "tracked.txt").read_text() == "good-u1\n"
+    assert _git(repo, "log", "--oneline", "--all").count("Implement U0") == 0
+    assert _git(repo, "log", "-1", "--pretty=%s") == "Implement U1"
+    assert any(
+        title == "Task Skipped" and "[USER TODO]" in text
+        for title, text in run_log.entries
+    )
+
+
 def json_load(path: Path):
     import json
 
