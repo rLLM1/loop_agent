@@ -659,6 +659,38 @@ def test_discussion_mode_writes_reviewed_task_list(repo: Path, tmp_path: Path):
     assert output.read_text().startswith("- [ ] T01: Fix tracked value")
 
 
+def test_parser_accepts_new_branch_and_legacy_branch_alias():
+    parser = agent_loop._build_parser()
+
+    parsed = parser.parse_args([
+        "--mode",
+        "execute",
+        "--prompt",
+        "Run tasks",
+        "--task-list-file",
+        "tasks.md",
+        "--run-key",
+        "tasks",
+        "--new-branch",
+        "feature/tasks",
+    ])
+    legacy = parser.parse_args([
+        "--mode",
+        "execute",
+        "--prompt",
+        "Run tasks",
+        "--task-list-file",
+        "tasks.md",
+        "--run-key",
+        "tasks",
+        "--branch",
+        "feature/legacy",
+    ])
+
+    assert parsed.new_branch == "feature/tasks"
+    assert legacy.new_branch == "feature/legacy"
+
+
 def test_work_queue_skips_task_after_dispute_limit_and_continues(
     repo: Path,
     tmp_path: Path,

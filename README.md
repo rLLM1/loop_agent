@@ -269,7 +269,7 @@ Example command:
 python ~/Code/agent_loop/agent_review_loop.py \
   --mode execute \
   --task-list-file /Users/pro/Code/Mds/rigel_code_improvement_tasks.md \
-  --branch rigel_code_improvement_07_04
+  --new-branch rigel_code_improvement_07_04
 ```
 
 ### Mode 3: Discussion Then Execution
@@ -288,7 +288,7 @@ python ~/Code/agent_loop/agent_review_loop.py \
   --prompt "Turn this findings file into tasks and implement them one by one." \
   --context-file /Users/pro/Code/Mds/loop_findings_to_improve_rigel.md \
   --task-list-file /Users/pro/Code/Mds/rigel_code_improvement_tasks.md \
-  --branch rigel_code_improvement_07_04
+  --new-branch rigel_code_improvement_07_04
 ```
 
 ## Task List Contract

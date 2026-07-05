@@ -1949,12 +1949,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Process exactly one unchecked checkbox item from --problems-file",
     )
     parser.add_argument(
+        "--new-branch",
+        dest="new_branch",
+        help=(
+            "Create this branch before starting a new execution run, or switch "
+            "to it if it already exists"
+        ),
+    )
+    parser.add_argument(
         "--branch",
-        help="Create/switch to this branch before starting a new execution run",
+        dest="new_branch",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--branch-base",
-        help="Base commit/ref used when creating --branch (default: HEAD)",
+        help="Base commit/ref used when creating --new-branch (default: HEAD)",
     )
     parser.add_argument(
         "--run-key",
@@ -2276,7 +2285,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not (repo / ".git").exists():
                 raise OrchestrationError(f"not a git repository: {repo}")
             if mode in {"execute", "discuss-execute"}:
-                _prepare_branch(repo, branch=args.branch, branch_base=args.branch_base)
+                _prepare_branch(
+                    repo,
+                    branch=args.new_branch,
+                    branch_base=args.branch_base,
+                )
             problems_path = (
                 args.problems_file.expanduser().resolve()
                 if args.problems_file
