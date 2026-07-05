@@ -365,6 +365,45 @@ def _parse_work_items(markdown: str) -> List[WorkItem]:
     return items
 
 
+def _parse_heading_work_items(markdown: str) -> List[WorkItem]:
+    items: List[WorkItem] = []
+    current: Optional[Dict[str, Any]] = None
+    heading_re = re.compile(r"^\s*#{2,6}\s+(.+?)\s*$")
+
+    def flush() -> None:
+        nonlocal current
+        if current is None:
+            return
+        body = "\n".join(current["lines"]).strip()
+        title = current["title"].strip()
+        text = title if not body else f"{title}\n{body}"
+        lowered = f"{title}\n{body}".lower()
+        checked = bool(
+            re.search(r"^\s*status\s*:\s*(done|complete|completed)\s*$", lowered, re.M)
+            or "[x]" in title.lower()
+        )
+        items.append(
+            WorkItem(
+                item_id=_slugify(title, max_length=80),
+                title=re.sub(r"^\[[ xX]\]\s*", "", title),
+                text=text,
+                checked=checked,
+            )
+        )
+        current = None
+
+    for line in markdown.splitlines():
+        match = heading_re.match(line)
+        if match:
+            flush()
+            current = {"title": match.group(1).strip(), "lines": []}
+            continue
+        if current is not None:
+            current["lines"].append(line)
+    flush()
+    return items
+
+
 class QueueProgressStore:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -445,9 +484,15 @@ def _task_to_work_item(task: Dict[str, Any]) -> WorkItem:
 
 
 def _parse_task_queue(problems_text: str) -> List[Dict[str, Any]]:
-    tasks = [_work_item_to_task(item) for item in _parse_work_items(problems_text)]
+    work_items = _parse_work_items(problems_text)
+    if not work_items:
+        work_items = _parse_heading_work_items(problems_text)
+    tasks = [_work_item_to_task(item) for item in work_items]
     if not tasks:
-        raise OrchestrationError("work queue has no checkbox tasks")
+        raise OrchestrationError(
+            "task list has no executable tasks; use Markdown checkboxes or "
+            "task headings"
+        )
     return tasks
 
 
@@ -1090,6 +1135,122 @@ artifact. If no issue remains, return status="clean" with an empty issues array.
         )
 
 
+class CodexPlanReviewer:
+    def __init__(
+        self,
+        *,
+        executable: str,
+        repo: Path,
+        model: Optional[str],
+        raw_log_dir: Optional[Path] = None,
+        raw_log_label: str = "run",
+        heartbeat_seconds: float = 0,
+        timeout_seconds: Optional[float] = None,
+    ) -> None:
+        self.executable = executable
+        self.repo = repo
+        self.model = model
+        self.raw_log_dir = raw_log_dir
+        self.raw_log_label = _slugify(raw_log_label)
+        self.heartbeat_seconds = heartbeat_seconds
+        self.timeout_seconds = timeout_seconds
+        self.call_count = 0
+
+    def review_task_list(
+        self,
+        *,
+        prompt: str,
+        task_list: str,
+        context_path: Optional[str] = None,
+    ) -> ReviewReply:
+        self.call_count += 1
+        review_prompt = f"""\
+Review this proposed task list. Review only: do not edit files, commit, or run
+destructive commands.
+
+Original user prompt:
+{prompt}
+
+Context file path, if any:
+{context_path or "(none)"}
+
+Proposed task list:
+{task_list}
+
+Check:
+- Is each item executable as one bounded coding task?
+- Does each task have enough scope, acceptance criteria, tests, and out-of-scope
+  boundaries for an implementation agent?
+- Are issues/tasks deduplicated without dropping distinct correctness concerns?
+- Are broad design disputes marked as needing user input instead of hidden?
+- Is the list suitable for checkpointed execution one item at a time?
+
+Report only actionable issues with the task list. If no issue remains, return
+status="clean" with an empty issues array.
+"""
+        with tempfile.TemporaryDirectory(prefix="agent-plan-review-") as tmp:
+            tmp_path = Path(tmp)
+            schema_path = tmp_path / "review_schema.json"
+            output_path = tmp_path / "review.json"
+            schema_path.write_text(json.dumps(REVIEW_SCHEMA), encoding="utf-8")
+            command = [
+                self.executable,
+                "exec",
+                "--sandbox",
+                "read-only",
+                "--cd",
+                str(self.repo),
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+            ]
+            if self.model:
+                command.extend(["--model", self.model])
+            command.append(review_prompt)
+            raw_log_path = None
+            if self.raw_log_dir is not None:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                raw_log_path = (
+                    self.raw_log_dir
+                    / (
+                        f"{stamp}_{self.raw_log_label}"
+                        f"_agent2_plan_review_{self.call_count:03d}.log"
+                    )
+                )
+            result = _run(
+                command,
+                cwd=self.repo,
+                raw_log_path=raw_log_path,
+                heartbeat_seconds=self.heartbeat_seconds,
+                timeout_seconds=self.timeout_seconds,
+                heartbeat_label=f"agent 2 plan review {self.call_count}",
+            )
+            if result.returncode != 0:
+                raise OrchestrationError(
+                    f"Codex plan review failed (exit {result.returncode}): "
+                    f"{result.stderr.strip()}"
+                )
+            raw = output_path.read_text() if output_path.exists() else result.stdout
+
+        value = _extract_json_object(raw)
+        _require_fields(
+            value,
+            status_values={"issues", "clean"},
+            text_fields={"summary"},
+        )
+        issues = value.get("issues")
+        if not isinstance(issues, list):
+            raise OrchestrationError("review field 'issues' must be a list")
+        if value["status"] == "clean" and issues:
+            raise OrchestrationError("clean review must have an empty issues list")
+        return ReviewReply(
+            status=value["status"],
+            summary=value["summary"],
+            issues=issues,
+        )
+
+
 def _git(repo: Path, *args: str) -> str:
     result = _run(["git", *args], cwd=repo)
     if result.returncode != 0:
@@ -1129,6 +1290,144 @@ def _commit_agent_changes(
     _git(repo, "add", "--", *paths)
     _git(repo, "commit", "-m", subject)
     return _git(repo, "rev-parse", "HEAD")
+
+
+def _prepare_branch(repo: Path, *, branch: Optional[str], branch_base: Optional[str]) -> None:
+    if not branch:
+        return
+    if _tracked_dirty_paths(repo):
+        raise OrchestrationError(
+            "tracked files are already modified; commit or stash them before "
+            "switching branches"
+        )
+    base = branch_base or "HEAD"
+    exists = _run(["git", "rev-parse", "--verify", branch], cwd=repo)
+    if exists.returncode == 0:
+        _git(repo, "switch", branch)
+        return
+    _git(repo, "switch", "-c", branch, base)
+
+
+def _squash_current_task_commit(repo: Path, task: Dict[str, Any]) -> Optional[str]:
+    base = str(task.get("task_base_commit") or "")
+    if not base:
+        return None
+    head = _git(repo, "rev-parse", "HEAD")
+    if head == base:
+        return head
+    count_text = _git(repo, "rev-list", "--count", f"{base}..HEAD")
+    try:
+        count = int(count_text)
+    except ValueError:
+        count = 1
+    if count <= 1:
+        return head
+    subjects = _git(repo, "log", "--reverse", "--format=%s", f"{base}..HEAD").splitlines()
+    subject = subjects[0] if subjects else str(task.get("title") or "Implement task")
+    _git(repo, "reset", "--soft", base)
+    _git(repo, "commit", "-m", subject)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _read_context_excerpt(context_file: Optional[Path], *, max_chars: int = 60000) -> tuple[Optional[str], str]:
+    if context_file is None:
+        return None, ""
+    resolved = context_file.expanduser().resolve()
+    try:
+        text = resolved.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise OrchestrationError(f"could not read context file {context_file}: {exc}") from exc
+    if not text:
+        raise OrchestrationError("context file is empty")
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n\n[TRUNCATED: context file exceeded prompt budget]"
+    return str(resolved), text
+
+
+def _discussion_prompt(
+    *,
+    prompt: str,
+    context_path: Optional[str],
+    context_text: str,
+    review_text: str = "",
+) -> str:
+    review_block = (
+        "\n\nAgent B review feedback to address before finalizing the task list:\n"
+        f"{review_text}\n"
+        if review_text
+        else ""
+    )
+    return (
+        f"{prompt}\n\n"
+        "DISCUSSION MODE. Do not edit repository files and do not commit. "
+        "Produce a normalized Markdown task list suitable for execution mode.\n\n"
+        "Each task must be a Markdown checkbox item using this shape:\n"
+        "- [ ] T01: Short imperative title\n"
+        "  Problem: ...\n"
+        "  Scope: ...\n"
+        "  Acceptance: ...\n"
+        "  Tests: ...\n"
+        "  Out of scope: ...\n"
+        "  Dependencies/Risk: ...\n\n"
+        "Rules: make tasks bounded, deduplicate duplicates, preserve distinct "
+        "correctness concerns, and mark user-decision items with [USER TODO]. "
+        "Return only the task list in message. Set commit_message to "
+        "'Write task list'.\n\n"
+        f"Context file path: {context_path or '(none)'}\n\n"
+        f"Context excerpt:\n{context_text or '(none)'}"
+        f"{review_block}"
+    )
+
+
+def run_discussion_loop(
+    *,
+    prompt: str,
+    context_file: Optional[Path],
+    task_list_file: Path,
+    agent1: Any,
+    plan_reviewer: Any,
+    run_log: Any,
+    max_rounds: int,
+) -> int:
+    context_path, context_text = _read_context_excerpt(context_file)
+    review_text = ""
+    latest_task_list = ""
+    for round_index in range(1, max_rounds + 1):
+        reply = agent1.ask(
+            _discussion_prompt(
+                prompt=prompt,
+                context_path=context_path,
+                context_text=context_text,
+                review_text=review_text,
+            )
+        )
+        if reply.status == "question":
+            raise OrchestrationError(
+                "discussion mode cannot continue without user input: "
+                f"{reply.message}"
+            )
+        latest_task_list = reply.message.strip()
+        if not latest_task_list:
+            raise OrchestrationError("Agent 1 returned an empty task list")
+        task_list_file.parent.mkdir(parents=True, exist_ok=True)
+        task_list_file.write_text(latest_task_list + "\n", encoding="utf-8")
+        run_log.add(f"Agent 1 Task List {round_index}", latest_task_list)
+        review = plan_reviewer.review_task_list(
+            prompt=prompt,
+            task_list=latest_task_list,
+            context_path=context_path,
+        )
+        formatted = _format_review(review)
+        run_log.add(f"Agent 2 Plan Review {round_index}", formatted)
+        print(f"\n[agent 2 plan review {round_index}]\n{formatted}", flush=True)
+        if review.status == "clean":
+            run_log.add("Result", f"Task list written to `{task_list_file}`.")
+            return 0
+        review_text = formatted
+    raise OrchestrationError(
+        f"discussion did not converge after {max_rounds} review rounds; "
+        f"latest task list was written to {task_list_file}"
+    )
 
 
 def _format_review(review: ReviewReply) -> str:
@@ -1360,6 +1659,7 @@ def run_state_loop(
     reviewer: Any,
     max_rounds: int,
     max_dispute_rounds: Optional[int] = None,
+    commit_policy: str = "squash-per-task",
     input_fn: Callable[[str], str] = input,
 ) -> int:
     repo = Path(state.repo)
@@ -1528,6 +1828,12 @@ def run_state_loop(
                 if state.work_queue:
                     task = _current_task(state)
                     if task is not None:
+                        if commit_policy == "squash-per-task":
+                            squashed = _squash_current_task_commit(repo, task)
+                            if squashed:
+                                state.commit = squashed
+                                state.review_head = squashed
+                                task["last_commit"] = squashed
                         task["status"] = "done"
                         task["review_round"] = state.review_round
                         task["summary"] = _reply_from_state(state).message
@@ -1585,6 +1891,7 @@ def run_loop(
     reviewer: Any,
     max_rounds: int,
     max_dispute_rounds: Optional[int] = None,
+    commit_policy: str = "squash-per-task",
     input_fn: Callable[[str], str] = input,
 ) -> int:
     """Compatibility wrapper used by callers that do not need persistence."""
@@ -1597,6 +1904,7 @@ def run_loop(
         reviewer=reviewer,
         max_rounds=max_rounds,
         max_dispute_rounds=max_dispute_rounds,
+        commit_policy=commit_policy,
         input_fn=input_fn,
     )
 
@@ -1605,9 +1913,30 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prompt", nargs="?", help="Initial request for agent 1")
     parser.add_argument(
+        "--prompt",
+        dest="prompt_option",
+        help="Initial request for agent 1; alternative to the positional prompt",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["legacy", "discussion", "execute", "discuss-execute"],
+        default="legacy",
+        help="Run the legacy loop, task-list discussion, execution, or both",
+    )
+    parser.add_argument(
+        "--context-file",
+        type=Path,
+        help="Optional context document for discussion modes",
+    )
+    parser.add_argument(
+        "--task-list-file",
+        type=Path,
+        help="Normalized Markdown task-list checkpoint file",
+    )
+    parser.add_argument(
         "--problems-file",
         type=Path,
-        help="Document containing an additional list of problems to address",
+        help="Deprecated alias for --context-file/--task-list-file in legacy paths",
     )
     parser.add_argument(
         "--repo",
@@ -1618,6 +1947,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--work-queue",
         action="store_true",
         help="Process exactly one unchecked checkbox item from --problems-file",
+    )
+    parser.add_argument(
+        "--branch",
+        help="Create/switch to this branch before starting a new execution run",
+    )
+    parser.add_argument(
+        "--branch-base",
+        help="Base commit/ref used when creating --branch (default: HEAD)",
     )
     parser.add_argument(
         "--run-key",
@@ -1662,6 +1999,30 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-rounds", type=int, default=10)
     parser.add_argument(
+        "--commit-policy",
+        choices=["squash-per-task", "per-round", "no-commit"],
+        default="squash-per-task",
+        help="Commit cleanup policy; default squashes each queue task to one commit",
+    )
+    parser.add_argument(
+        "--push",
+        action="store_true",
+        default=False,
+        help="Reserved for future use; current script never pushes",
+    )
+    parser.add_argument(
+        "--no-push",
+        action="store_false",
+        dest="push",
+        help="Do not push changes (default)",
+    )
+    parser.add_argument(
+        "--auto-execute",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="For discuss-execute mode, continue into execution after writing tasks",
+    )
+    parser.add_argument(
         "--max-dispute-rounds",
         type=int,
         default=5,
@@ -1693,6 +2054,43 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.prompt and args.prompt_option:
+        raise SystemExit("provide either positional prompt or --prompt, not both")
+    prompt_arg = args.prompt_option or args.prompt
+    if args.push:
+        raise SystemExit("--push is not implemented; the agent loop is no-push only")
+    if args.commit_policy == "no-commit":
+        raise SystemExit(
+            "--commit-policy no-commit is not implemented because Agent 2 "
+            "reviews committed ranges"
+        )
+    mode = args.mode
+    context_file = args.context_file
+    task_list_file = args.task_list_file
+    if mode in {"discussion", "discuss-execute"} and context_file is None:
+        context_file = args.problems_file
+    if mode == "execute" and task_list_file is None:
+        task_list_file = args.problems_file
+    if mode == "legacy":
+        task_list_file = None
+    elif mode == "execute":
+        args.work_queue = True
+        if task_list_file is None:
+            raise SystemExit("--mode execute requires --task-list-file")
+        args.problems_file = task_list_file
+    elif mode == "discussion":
+        if task_list_file is None:
+            raise SystemExit("--mode discussion requires --task-list-file")
+    elif mode == "discuss-execute":
+        if task_list_file is None:
+            raise SystemExit("--mode discuss-execute requires --task-list-file")
+        if args.auto_execute is False:
+            raise SystemExit(
+                "--no-auto-execute is not supported yet for discuss-execute; "
+                "use --mode discussion instead"
+            )
+        args.work_queue = True
+        args.problems_file = task_list_file
     if args.max_rounds <= 0:
         raise SystemExit("--max-rounds must be positive")
     if args.max_dispute_rounds <= 0:
@@ -1702,7 +2100,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.agent_timeout_minutes <= 0:
         raise SystemExit("--agent-timeout-minutes must be positive")
     if args.work_queue and not args.problems_file:
-        raise SystemExit("--work-queue requires --problems-file")
+        raise SystemExit("--work-queue requires --problems-file or --task-list-file")
     if args.work_queue and not args.run_key:
         raise SystemExit("--work-queue requires --run-key")
     if args.new_run and not args.run_key:
@@ -1725,20 +2123,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if lock is not None:
             lock.__enter__()
-        if args.resume:
-            if args.prompt or args.problems_file:
-                raise OrchestrationError(
-                    "a resumed run cannot accept a new prompt or problems file"
-                )
-            state = state_store.load(args.resume)
-        elif args.resume_last:
-            if args.prompt or args.problems_file:
-                raise OrchestrationError(
-                    "a resumed run cannot accept a new prompt or problems file"
-                )
-            state = state_store.load_latest_incomplete()
-        else:
-            prompt = args.prompt
+        if mode == "discussion":
+            if args.resume or args.resume_last:
+                raise OrchestrationError("discussion mode resume is not implemented")
+            prompt = prompt_arg
             if not prompt:
                 prompt = input("Task for agent 1: ").strip()
             if not prompt:
@@ -1746,6 +2134,149 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             repo = (args.repo or Path.cwd()).expanduser().resolve()
             if not (repo / ".git").exists():
                 raise OrchestrationError(f"not a git repository: {repo}")
+            for executable in (args.agent1_command, args.agent2_command):
+                if shutil.which(executable) is None:
+                    raise OrchestrationError(
+                        f"required executable not found: {executable}"
+                    )
+            raw_log_dir.mkdir(parents=True, exist_ok=True)
+            dummy_state = RunState(
+                version=STATE_VERSION,
+                run_id=str(uuid.uuid4()),
+                repo=str(repo),
+                prompt=prompt,
+                problems_file=str(context_file.expanduser().resolve()) if context_file else None,
+                problems_text="",
+                base_commit=_git(repo, "rev-parse", "HEAD"),
+                baseline_untracked=sorted(_untracked_paths(repo)),
+                agent1_session_id=str(uuid.uuid4()),
+                run_key=args.run_key,
+            )
+            run_log = RunLog(root=log_root, state=dummy_state, resumed=False)
+            print(f"[orchestrator] Run log: {run_log.path}", flush=True)
+            print(f"[orchestrator] Raw logs: {raw_log_dir}", flush=True)
+            raw_log_label = _run_label(dummy_state)
+            agent1 = ClaudeAgent(
+                executable=args.agent1_command,
+                repo=repo,
+                model=args.agent1_model,
+                permission_mode=args.agent1_permission_mode,
+                raw_log_dir=raw_log_dir,
+                raw_log_label=raw_log_label,
+                heartbeat_seconds=args.heartbeat_seconds,
+                timeout_seconds=args.agent_timeout_minutes * 60,
+                session_mode=args.agent1_session_mode,
+            )
+            plan_reviewer = CodexPlanReviewer(
+                executable=args.agent2_command,
+                repo=repo,
+                model=args.agent2_model,
+                raw_log_dir=raw_log_dir,
+                raw_log_label=raw_log_label,
+                heartbeat_seconds=args.heartbeat_seconds,
+                timeout_seconds=args.agent_timeout_minutes * 60,
+            )
+            result = run_discussion_loop(
+                prompt=prompt,
+                context_file=context_file,
+                task_list_file=task_list_file.expanduser().resolve(),
+                agent1=agent1,
+                plan_reviewer=plan_reviewer,
+                run_log=run_log,
+                max_rounds=args.max_rounds,
+            )
+            run_log.finish(f"Discussion complete. Task list: `{task_list_file}`")
+            return result
+        if mode == "discuss-execute":
+            if args.resume or args.resume_last:
+                raise OrchestrationError("discuss-execute mode resume is not implemented")
+            prompt = prompt_arg
+            if not prompt:
+                prompt = input("Task for agent 1: ").strip()
+            if not prompt:
+                raise OrchestrationError("a non-empty prompt is required")
+            repo = (args.repo or Path.cwd()).expanduser().resolve()
+            if not (repo / ".git").exists():
+                raise OrchestrationError(f"not a git repository: {repo}")
+            for executable in (args.agent1_command, args.agent2_command):
+                if shutil.which(executable) is None:
+                    raise OrchestrationError(
+                        f"required executable not found: {executable}"
+                    )
+            raw_log_dir.mkdir(parents=True, exist_ok=True)
+            dummy_state = RunState(
+                version=STATE_VERSION,
+                run_id=str(uuid.uuid4()),
+                repo=str(repo),
+                prompt=prompt,
+                problems_file=str(context_file.expanduser().resolve()) if context_file else None,
+                problems_text="",
+                base_commit=_git(repo, "rev-parse", "HEAD"),
+                baseline_untracked=sorted(_untracked_paths(repo)),
+                agent1_session_id=str(uuid.uuid4()),
+                run_key=args.run_key,
+            )
+            discussion_log = RunLog(root=log_root, state=dummy_state, resumed=False)
+            print(f"[orchestrator] Discussion run log: {discussion_log.path}", flush=True)
+            print(f"[orchestrator] Raw logs: {raw_log_dir}", flush=True)
+            raw_log_label = _run_label(dummy_state)
+            agent1 = ClaudeAgent(
+                executable=args.agent1_command,
+                repo=repo,
+                model=args.agent1_model,
+                permission_mode=args.agent1_permission_mode,
+                raw_log_dir=raw_log_dir,
+                raw_log_label=raw_log_label,
+                heartbeat_seconds=args.heartbeat_seconds,
+                timeout_seconds=args.agent_timeout_minutes * 60,
+                session_mode=args.agent1_session_mode,
+            )
+            plan_reviewer = CodexPlanReviewer(
+                executable=args.agent2_command,
+                repo=repo,
+                model=args.agent2_model,
+                raw_log_dir=raw_log_dir,
+                raw_log_label=raw_log_label,
+                heartbeat_seconds=args.heartbeat_seconds,
+                timeout_seconds=args.agent_timeout_minutes * 60,
+            )
+            result = run_discussion_loop(
+                prompt=prompt,
+                context_file=context_file,
+                task_list_file=task_list_file.expanduser().resolve(),
+                agent1=agent1,
+                plan_reviewer=plan_reviewer,
+                run_log=discussion_log,
+                max_rounds=args.max_rounds,
+            )
+            discussion_log.finish(f"Discussion complete. Task list: `{task_list_file}`")
+            if result != 0:
+                return result
+            # Fall through into execution using the generated task list.
+            args.problems_file = task_list_file.expanduser().resolve()
+        if args.resume:
+            if prompt_arg or args.problems_file:
+                raise OrchestrationError(
+                    "a resumed run cannot accept a new prompt or problems file"
+                )
+            state = state_store.load(args.resume)
+        elif args.resume_last:
+            if prompt_arg or args.problems_file:
+                raise OrchestrationError(
+                    "a resumed run cannot accept a new prompt or problems file"
+                )
+            state = state_store.load_latest_incomplete()
+        else:
+            prompt = prompt_arg
+            if not prompt:
+                prompt = input("Task for agent 1: ").strip()
+            if not prompt:
+                raise OrchestrationError("a non-empty prompt is required")
+            repo = (args.repo or Path.cwd()).expanduser().resolve()
+            if not (repo / ".git").exists():
+                raise OrchestrationError(f"not a git repository: {repo}")
+            if mode in {"execute", "discuss-execute"}:
+                _prepare_branch(repo, branch=args.branch, branch_base=args.branch_base)
             problems_path = (
                 args.problems_file.expanduser().resolve()
                 if args.problems_file
@@ -1843,6 +2374,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 reviewer=reviewer,
                 max_rounds=args.max_rounds,
                 max_dispute_rounds=args.max_dispute_rounds,
+                commit_policy=args.commit_policy,
             )
         except KeyboardInterrupt:
             state_store.save(state)

@@ -449,6 +449,28 @@ def test_parse_work_items_and_select_next():
     assert selected_after_done.title == "U2: later"
 
 
+def test_parse_task_queue_accepts_heading_tasks():
+    text = (
+        "# Tasks\n\n"
+        "## T01: Fix first thing\n"
+        "Status: todo\n"
+        "Problem: first problem\n"
+        "Acceptance: first acceptance\n\n"
+        "## T02: Already done\n"
+        "Status: done\n"
+        "Problem: old problem\n"
+    )
+
+    tasks = agent_loop._parse_task_queue(text)
+
+    assert [task["title"] for task in tasks] == [
+        "T01: Fix first thing",
+        "T02: Already done",
+    ]
+    assert [task["status"] for task in tasks] == ["pending", "done"]
+    assert "first problem" in tasks[0]["text"]
+
+
 def test_work_queue_state_prompt_limits_to_selected_item(repo: Path, tmp_path: Path):
     queue = tmp_path / "queue.md"
     queue.write_text(
@@ -532,6 +554,109 @@ def test_work_queue_main_processes_all_items_in_one_invocation(repo: Path, tmp_p
     state = json_load(tmp_path / "logs" / "state" / "by_key" / "frozen-test.json")
     assert [task["status"] for task in state["tasks"]] == ["done", "done"]
     assert state["phase"] == "complete"
+
+
+def test_execute_mode_uses_task_list_file(repo: Path, tmp_path: Path):
+    queue = tmp_path / "tasks.md"
+    queue.write_text(
+        "## T01: write value\n"
+        "Problem: tracked.txt needs a value.\n"
+        "Acceptance: tracked.txt says task-list.\n"
+    )
+    fake_claude = tmp_path / "fake_claude.py"
+    fake_claude.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib\n"
+        "pathlib.Path('tracked.txt').write_text('task-list\\n')\n"
+        "print(json.dumps({\n"
+        "  'status': 'conclusion',\n"
+        "  'message': 'implemented task-list item',\n"
+        "  'commit_message': 'Implement task-list item'\n"
+        "}))\n"
+    )
+    fake_claude.chmod(0o755)
+    fake_codex = tmp_path / "fake_codex.py"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+        "open(out, 'w').write(json.dumps({'status':'clean','summary':'ok','issues':[]}))\n"
+    )
+    fake_codex.chmod(0o755)
+
+    result = agent_loop.main([
+        "--mode",
+        "execute",
+        "--prompt",
+        "Implement task list",
+        "--repo",
+        str(repo),
+        "--task-list-file",
+        str(queue),
+        "--run-key",
+        "execute-task-list-test",
+        "--run-log-dir",
+        str(tmp_path / "logs"),
+        "--agent1-command",
+        str(fake_claude),
+        "--agent2-command",
+        str(fake_codex),
+        "--heartbeat-seconds",
+        "0",
+    ])
+
+    assert result == 0
+    assert (repo / "tracked.txt").read_text() == "task-list\n"
+    assert _git(repo, "log", "-1", "--pretty=%s") == "Implement task-list item"
+
+
+def test_discussion_mode_writes_reviewed_task_list(repo: Path, tmp_path: Path):
+    output = tmp_path / "tasks.md"
+    context = tmp_path / "context.md"
+    context.write_text("Finding: tracked.txt needs a bounded task.\n")
+    fake_claude = tmp_path / "fake_claude.py"
+    fake_claude.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json\n"
+        "print(json.dumps({\n"
+        "  'status': 'conclusion',\n"
+        "  'message': '- [ ] T01: Fix tracked value\\\\n  Problem: tracked.txt needs a bounded task.\\\\n  Acceptance: test passes.',\n"
+        "  'commit_message': 'Write task list'\n"
+        "}))\n"
+    )
+    fake_claude.chmod(0o755)
+    fake_codex = tmp_path / "fake_codex.py"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+        "open(out, 'w').write(json.dumps({'status':'clean','summary':'task list ok','issues':[]}))\n"
+    )
+    fake_codex.chmod(0o755)
+
+    result = agent_loop.main([
+        "--mode",
+        "discussion",
+        "--prompt",
+        "Create tasks",
+        "--repo",
+        str(repo),
+        "--context-file",
+        str(context),
+        "--task-list-file",
+        str(output),
+        "--run-log-dir",
+        str(tmp_path / "logs"),
+        "--agent1-command",
+        str(fake_claude),
+        "--agent2-command",
+        str(fake_codex),
+        "--heartbeat-seconds",
+        "0",
+    ])
+
+    assert result == 0
+    assert output.read_text().startswith("- [ ] T01: Fix tracked value")
 
 
 def test_work_queue_skips_task_after_dispute_limit_and_continues(

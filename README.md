@@ -59,6 +59,37 @@ not the full problem document. If the process is interrupted mid-task, the same
 command resumes the saved run because `--run-key` points to the existing
 incomplete state.
 
+The preferred explicit execution form is:
+
+```bash
+python ~/Code/agent_loop/agent_review_loop.py \
+  --mode execute \
+  --prompt "Implement the task list one item at a time. Do not push." \
+  --task-list-file /path/to/tasks.md \
+  --run-key my-task-run
+```
+
+Generate a normalized task list without editing code:
+
+```bash
+python ~/Code/agent_loop/agent_review_loop.py \
+  --mode discussion \
+  --prompt "Turn this findings file into bounded coding tasks." \
+  --context-file /path/to/findings.md \
+  --task-list-file /path/to/tasks.md
+```
+
+Generate the task list and then execute it:
+
+```bash
+python ~/Code/agent_loop/agent_review_loop.py \
+  --mode discuss-execute \
+  --prompt "Turn this findings file into tasks and implement them one by one." \
+  --context-file /path/to/findings.md \
+  --task-list-file /path/to/tasks.md \
+  --run-key my-task-run
+```
+
 Every checkpoint is saved under `~/Code/agent_loop/run_logs/state/`. Resume a
 specific run or the newest incomplete run:
 
@@ -88,6 +119,9 @@ Useful options:
 
 ```text
 --repo PATH
+--mode legacy|discussion|execute|discuss-execute
+--context-file PATH
+--task-list-file PATH
 --problems-file PATH
 --work-queue
 --run-key KEY
@@ -99,14 +133,17 @@ Useful options:
 --agent2-model MODEL
 --agent1-permission-mode MODE
 --agent1-session-mode fresh|resume
+--commit-policy squash-per-task|per-round|no-commit
 --max-rounds N
+--max-dispute-rounds N
 --heartbeat-seconds N
 --agent-timeout-minutes N
 ```
 
 The target repository must have no tracked modifications when starting a new
-run. Existing untracked files are not committed, even if Claude edits them.
-The script creates commits but never pushes.
+execution run. Existing untracked files are not committed, even if Claude edits
+them. The script creates commits but never pushes. `--no-push` is the default;
+`--push` is intentionally rejected until remote-write behavior is implemented.
 
 `--run-key` also adds a lock file under `run_logs/state/by_key/` so the same
 key cannot run concurrently in two terminals. Use `--break-lock` only when the
@@ -172,10 +209,10 @@ inspect the tree; that usually means Claude edited files but did not return
 structured JSON. This avoids blindly running a fresh Claude session on top of
 unknown partial edits.
 
-## Planned Mode Model
+## Mode Model
 
-The next version should make the loop modes explicit instead of overloading one
-prompt shape for planning, execution, review, and resume.
+The loop has explicit modes instead of overloading one prompt shape for
+planning, execution, review, and resume.
 
 ### Mode 1: Discussion
 
@@ -190,7 +227,7 @@ issue, a list of issues, an unstructured plan, or a poorly formatted task list.
 Regardless of input shape, the output is a normalized task list that can become
 the checkpoint for execution mode.
 
-Example intended command shape:
+Example command:
 
 ```bash
 python ~/Code/agent_loop/agent_review_loop.py \
@@ -226,7 +263,7 @@ Default behavior should be:
 fix commits may exist during the task, but the final task state should be
 squashed or amended before moving to the next task.
 
-Example intended command shape:
+Example command:
 
 ```bash
 python ~/Code/agent_loop/agent_review_loop.py \
@@ -238,12 +275,12 @@ python ~/Code/agent_loop/agent_review_loop.py \
 ### Mode 3: Discussion Then Execution
 
 Discussion-execution mode first runs discussion mode to create or refresh the
-task list, then runs execution mode over that task list. `--auto-execute` should
-default to enabled for this mode because the mode name already implies both
-phases. A future `--approval-gate` flag can force a pause after task-list
-generation when human approval is needed.
+task list, then runs execution mode over that task list. `--auto-execute`
+defaults to enabled for this mode because the mode name already implies both
+phases. `--no-auto-execute` is currently rejected; use `--mode discussion` when
+you want a planning-only run.
 
-Example intended command shape:
+Example command:
 
 ```bash
 python ~/Code/agent_loop/agent_review_loop.py \
@@ -359,44 +396,25 @@ breakage, public format changes, or task-scope violations. Non-blocking disputes
 include variable names, optional docs, or full-suite test caveats when targeted
 tests pass.
 
-## Loop Improvement Plan
+## Remaining Improvements
 
-Implement the three-mode design in small changes:
+Implemented: explicit modes, `--context-file`, `--task-list-file`,
+heading/checkbox task parsing, task-list discussion review, execution over task
+lists, default `squash-per-task`, no-push default, blocked-review detection, and
+work-queue dispute skipping with `[USER TODO]`.
 
-1. Add explicit CLI modes: `--mode discussion`, `--mode execute`, and
-   `--mode discuss-execute`. Keep old positional-prompt behavior as a
-   compatibility alias.
-2. Rename the broad document input to `--context-file` for discussion modes.
-   Keep `--problems-file` as a deprecated alias.
-3. Add `--task-list-file` for execution checkpoints. Execution mode should not
-   consume arbitrary context files directly.
-4. Add a task-list parser that accepts normalized task blocks and legacy
-   checkbox tasks. Discussion mode should output normalized task blocks.
-5. Add task-list validation before execution. Invalid tasks should be
+Still worth improving:
+
+1. Add stricter task-list validation before execution. Invalid tasks should be
    normalized, skipped with a reason, or marked `[USER TODO]`.
-6. Make `--commit-policy squash-per-task` the default. Support `per-round` and
-   `no-commit` as explicit alternatives.
-7. Make `--no-push` the default and require an explicit future `--push` flag for
-   any remote write.
-8. Make `--auto-execute` default to enabled only for `--mode discuss-execute`.
-9. Add `--max-dispute-rounds`, default `5`, and enforce it separately from
-   generic review-round limits. In work-queue execution, reaching the dispute
-   limit should skip the current task, write `[USER TODO]` to the worklog,
-   reset back to that task's base commit so unresolved code does not contaminate
-   later tasks, and continue to the next task. In non-queue mode, reaching the
-   limit should stop the run.
-10. Persist task checkpoints in state: current task id, task base commit, latest
-    head, review rounds, Agent A decisions, Agent B findings, status, and
-    worklog path.
-11. Start fresh Agent A sessions per task and preferably per review-fix round,
-    passing only the current task, compact state summary, and latest findings.
-12. Make Agent B review range explicit: `task_base_commit..HEAD`.
-13. Add structured Agent A decision output for each Agent B finding:
-    `agree`, `disagree`, `defer`, or `needs_user`.
-14. Add blocked-review detection only when Agent B cannot inspect the repo. A
-    missing full pytest run is a caveat, not a blocker.
-15. Write task progress, skipped tasks, deferred tasks, and unresolved disputes
-    to the worklog with `[USER TODO]` where human action is required.
+2. Persist richer task checkpoints in state: Agent A decisions, Agent B finding
+   ids, status transitions, and worklog path.
+3. Add structured Agent A decision output for each Agent B finding:
+   `agree`, `disagree`, `defer`, or `needs_user`.
+4. Make `per-round` and `no-commit` commit policies fully distinct. Today the
+   useful default is `squash-per-task`; `per-round` mostly reflects the legacy
+   behavior and `no-commit` is not useful for review ranges.
+5. Add an optional approval gate between discussion and execution.
 
 ## Test
 
