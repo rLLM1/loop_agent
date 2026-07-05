@@ -24,14 +24,6 @@ python ~/Code/agent_loop/agent_review_loop.py \
   "Implement the requested feature and test it"
 ```
 
-Add a document containing a list of known problems:
-
-```bash
-python ~/Code/agent_loop/agent_review_loop.py \
-  "Fix the documented problems and test the result" \
-  --problems-file /path/to/problems.md
-```
-
 Process a long plan as a checkbox task queue:
 
 ```markdown
@@ -44,7 +36,7 @@ Process a long plan as a checkbox task queue:
 ```bash
 python ~/Code/agent_loop/agent_review_loop.py \
   "Implement this plan one unit at a time" \
-  --problems-file /path/to/work_queue.md \
+  --task-list-file /path/to/work_queue.md \
   --work-queue \
   --run-key frozen-encoding
 ```
@@ -55,7 +47,7 @@ items in the same invocation. For each task it starts a fresh Claude session,
 commits the task, runs Codex review on that task's commit range, and repeats
 fresh Claude fix sessions until Codex reports clean. The plan file is read once
 at run start and is not edited; the durable state stores compact parsed tasks,
-not the full problem document. If the process is interrupted mid-task, the same
+not the full context document. If the process is interrupted mid-task, the same
 command resumes the saved run because `--run-key` points to the existing
 incomplete state.
 
@@ -86,8 +78,14 @@ python ~/Code/agent_loop/agent_review_loop.py \
   --mode discuss-execute \
   --prompt "Turn this findings file into tasks and implement them one by one." \
   --context-file /path/to/findings.md \
-  --task-list-file /path/to/tasks.md \
   --run-key my-task-run
+```
+
+When `--task-list-file` is omitted, discussion and discussion-execution modes
+write the checkpoint task list under:
+
+```text
+~/Code/agent_loop/run_logs/state/by_key/<run-key>.tasks.md
 ```
 
 Every checkpoint is saved under `~/Code/agent_loop/run_logs/state/`. Resume a
@@ -99,15 +97,15 @@ python ~/Code/agent_loop/agent_review_loop.py --resume-last
 ```
 
 Each program invocation writes one Markdown transcript to
-`~/Code/agent_loop/run_logs/`. It records the request, problem-file path,
+`~/Code/agent_loop/run_logs/`. It records the request, context/task-list path,
 selected/current task text, agent questions/conclusions, user answers, review
 findings, commits, and final status. It does not record agent thinking, shell
-commands, raw tool output, or full problem documents in work-queue mode.
+commands, raw tool output, or full context documents in work-queue mode.
 
 Claude/Codex subprocess stdout and stderr are streamed to raw logs under
 `~/Code/agent_loop/run_logs/raw/`. Raw log filenames include the date/time and a
-label derived from the problems-file name, falling back to the prompt when no
-problems file is provided. The default heartbeat prints every 30 seconds with
+label derived from the context/task-list filename, falling back to the prompt
+when no file is provided. The default heartbeat prints every 30 seconds with
 the active raw log path, and each individual agent call times out after 60
 minutes by default.
 
@@ -122,7 +120,6 @@ Useful options:
 --mode legacy|discussion|execute|discuss-execute
 --context-file PATH
 --task-list-file PATH
---problems-file PATH
 --work-queue
 --run-key KEY
 --new-run
@@ -278,7 +275,12 @@ Discussion-execution mode first runs discussion mode to create or refresh the
 task list, then runs execution mode over that task list. `--auto-execute`
 defaults to enabled for this mode because the mode name already implies both
 phases. `--no-auto-execute` is currently rejected; use `--mode discussion` when
-you want a planning-only run.
+you want a planning-only run. If the discussion reaches `--max-rounds` but has
+produced a task list, the loop marks tasks named in unresolved review findings
+with `[USER TODO]`, records the review caveats, and continues executing other
+ready tasks. If rerun with the same `--run-key`, the loop reuses the existing
+task list, resumes executable tasks by status, and focuses discussion only when
+no ready work remains but tasks still need user clarification.
 
 Example command:
 
@@ -287,7 +289,6 @@ python ~/Code/agent_loop/agent_review_loop.py \
   --mode discuss-execute \
   --prompt "Turn this findings file into tasks and implement them one by one." \
   --context-file /Users/pro/Code/Mds/loop_findings_to_improve_rigel.md \
-  --task-list-file /Users/pro/Code/Mds/rigel_code_improvement_tasks.md \
   --new-branch rigel_code_improvement_07_04
 ```
 
@@ -314,25 +315,52 @@ iteration. If an item is not executable, it should either normalize it locally,
 skip it with a reason, or stop with `[USER TODO]` when a product/design decision
 is required.
 
-Recommended task statuses:
+Task statuses:
 
 ```text
-todo
-in_progress
-done
-skipped
-deferred
-blocked
-needs_user
+pending: created but not validated or started; executable.
+ready: validated and safe to execute.
+in_progress: currently running or interrupted mid-task; executable if state matches.
+done: implemented, committed, and reviewed clean.
+skipped: intentionally bypassed for this run; requires Reason/Context.
+deferred: valid task postponed until a dependency or decision; requires Reason/Next action.
+discussion_failed: task definition did not converge; requires [USER TODO].
+discussion_failed_max_rounds: discussion hit --max-rounds; requires [USER TODO].
+execution_failed: Agent A/B coding review did not converge; requires [USER TODO].
+blocked: repo/environment prevents safe progress; stops the run.
+needs_user: product/design choice required; requires [USER TODO], Context, Options.
+invalid: malformed/non-executable task; requires Reason and Next action.
+duplicate: covered by another task; requires duplicate-of context.
+not_applicable: code inspection shows the issue no longer applies; requires evidence.
 ```
 
-When the loop skips the current task, it should document the progress and
-disagreement in the worklog using a visible marker:
+`[USER TODO]` is a human-action marker, not a status. It may appear on
+`needs_user`, `discussion_failed`, `execution_failed`, or `deferred` tasks. It
+does not mean the same thing as `skipped`.
+
+Every non-success status must include enough context to decide what to do next:
+
+```text
+Reason: why this status happened
+Context: relevant Agent A/B disagreement, code evidence, or blocker
+Options: possible user choices when a user decision is needed
+Recommended: optional recommended choice
+Next action: what resumes or unblocks the task
+```
+
+When the loop skips, defers, or fails the current task, it should document the
+progress and disagreement in the worklog using a visible marker:
 
 ```text
 [USER TODO] T7 skipped: Agent A and Agent B disagree about whether this changes
 the public precompute format. User decision required before implementation.
 ```
+
+Execution follows a go-as-far-as-possible policy: ready/pending/in-progress
+tasks are executed; `done`, `duplicate`, and `not_applicable` tasks are skipped;
+`needs_user`, `discussion_failed`, and `[USER TODO]` tasks are left for focused
+discussion or user input while other ready tasks continue. At program exit, the
+transcript reports the task-list path so the user can inspect remaining work.
 
 ## Stop, Skip, And Dispute Rules
 

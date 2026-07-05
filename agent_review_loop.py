@@ -124,6 +124,27 @@ class WorkItem:
     summary: str = ""
 
 
+EXECUTABLE_TASK_STATUSES = {
+    "pending",
+    "ready",
+    "in_progress",
+    "execution_failed",
+}
+
+NON_EXECUTABLE_TASK_STATUSES = {
+    "done",
+    "skipped",
+    "deferred",
+    "discussion_failed",
+    "discussion_failed_max_rounds",
+    "blocked",
+    "needs_user",
+    "invalid",
+    "duplicate",
+    "not_applicable",
+}
+
+
 @dataclass
 class RunState:
     version: int
@@ -280,9 +301,9 @@ class RunLog:
             )
         if state.problems_text and not state.work_queue:
             source = state.problems_file or "provided document"
-            self.add("Problem List", f"Source: `{source}`\n\n{state.problems_text}")
+            self.add("Context Document", f"Source: `{source}`\n\n{state.problems_text}")
         elif state.problems_file:
-            self.add("Problem File", f"Source: `{state.problems_file}`")
+            self.add("Context / Task-List File", f"Source: `{state.problems_file}`")
         if resumed and state.phase == "awaiting_user" and state.reply:
             self.add("Pending Agent 1 Question", state.reply.get("message", ""))
 
@@ -456,12 +477,15 @@ def _select_next_work_item(
 
 
 def _work_item_to_task(item: WorkItem) -> Dict[str, Any]:
+    status = _extract_task_status(item.text)
+    if item.checked:
+        status = "done"
     return {
         "id": item.item_id,
         "title": item.title,
         "text": item.text,
         "checked": item.checked,
-        "status": "done" if item.checked else "pending",
+        "status": status or "pending",
         "task_base_commit": "",
         "last_commit": "",
         "review_round": 1,
@@ -496,6 +520,43 @@ def _parse_task_queue(problems_text: str) -> List[Dict[str, Any]]:
     return tasks
 
 
+def _extract_task_status(text: str) -> str:
+    match = re.search(r"^\s*Status\s*:\s*([A-Za-z0-9_-]+)\s*$", text, re.M)
+    if not match:
+        return ""
+    status = match.group(1).strip().lower()
+    aliases = {
+        "todo": "pending",
+        "complete": "done",
+        "completed": "done",
+    }
+    return aliases.get(status, status)
+
+
+def _task_needs_user(task: Dict[str, Any]) -> bool:
+    text = f"{task.get('title', '')}\n{task.get('text', '')}"
+    return "[USER TODO]" in text
+
+
+def _task_is_executable(task: Dict[str, Any]) -> bool:
+    status = str(task.get("status") or "pending").lower()
+    if _task_needs_user(task):
+        return False
+    if status in NON_EXECUTABLE_TASK_STATUSES:
+        return False
+    return status in EXECUTABLE_TASK_STATUSES or not status
+
+
+def _task_requires_discussion(task: Dict[str, Any]) -> bool:
+    status = str(task.get("status") or "pending").lower()
+    return _task_needs_user(task) or status in {
+        "discussion_failed",
+        "discussion_failed_max_rounds",
+        "needs_user",
+        "invalid",
+    }
+
+
 def _current_task(state: RunState) -> Optional[Dict[str, Any]]:
     if not state.tasks or state.current_task_index < 0:
         return None
@@ -506,9 +567,63 @@ def _current_task(state: RunState) -> Optional[Dict[str, Any]]:
 
 def _select_next_task_index(state: RunState) -> Optional[int]:
     for index, task in enumerate(state.tasks or []):
-        if task.get("status") not in {"done", "skipped"}:
+        if _task_is_executable(task):
             return index
     return None
+
+
+def _task_queue_summary(tasks: Sequence[Dict[str, Any]]) -> str:
+    counts: Dict[str, int] = {}
+    for task in tasks:
+        status = str(task.get("status") or "pending")
+        counts[status] = counts.get(status, 0) + 1
+    if not counts:
+        return "No tasks."
+    return ", ".join(f"{status}: {count}" for status, count in sorted(counts.items()))
+
+
+def _upsert_status_line(body: str, status: str) -> str:
+    if re.search(r"^\s*Status\s*:", body, re.M):
+        return re.sub(r"^\s*Status\s*:.*$", f"  Status: {status}", body, count=1, flags=re.M)
+    lines = body.splitlines()
+    if not lines:
+        return f"  Status: {status}"
+    return "\n".join([lines[0], f"  Status: {status}", *lines[1:]])
+
+
+def _persist_task_list_status(state: RunState) -> None:
+    if not state.work_queue or not state.problems_file or not state.tasks:
+        return
+    path = Path(state.problems_file)
+    lines = [
+        "# Agent Loop Task Queue",
+        "",
+        f"Run key: {state.run_key or ''}",
+        f"Execution status: {state.phase}",
+        f"Current task: {state.work_item_id or ''}",
+        f"Last updated: {datetime.now(timezone.utc).isoformat()}",
+        f"Summary: {_task_queue_summary(state.tasks)}",
+        "",
+    ]
+    for task in state.tasks:
+        title = str(task.get("title") or task.get("id") or "task")
+        status = str(task.get("status") or "pending")
+        marker = "x" if status == "done" else " "
+        raw_text = str(task.get("text") or title)
+        body_lines = raw_text.splitlines()
+        body = "\n".join(body_lines[1:]).strip() if body_lines else ""
+        body = _upsert_status_line(body or f"  Status: {status}", status)
+        lines.append(f"- [{marker}] {title}")
+        if body:
+            lines.append(body)
+        if task.get("last_commit"):
+            lines.append(f"  Last commit: {task.get('last_commit')}")
+        if task.get("summary"):
+            summary = " ".join(str(task.get("summary")).split())
+            lines.append(f"  Last summary: {summary[:500]}")
+        lines.append("")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def _start_work_queue_task(state: RunState, repo: Path, index: int) -> None:
@@ -565,6 +680,7 @@ def _skip_current_work_queue_task(
     )
     state.commit = _git(repo, "rev-parse", "HEAD")
     run_log.add("Task Skipped", message)
+    _persist_task_list_status(state)
 
 
 def _task_block(task: Dict[str, Any]) -> str:
@@ -600,7 +716,7 @@ def _task_prompt(state: RunState, *, review_text: str = "") -> str:
     task = _current_task(state)
     if task is None:
         raise OrchestrationError("no current task selected")
-    source = state.problems_file or "provided problem file"
+    source = state.problems_file or "provided task-list file"
     mode = "fix the Codex review findings" if review_text else "implement the task"
     extra = (
         "\n\nCodex review findings to address:\n"
@@ -615,7 +731,7 @@ def _task_prompt(state: RunState, *, review_text: str = "") -> str:
         "diff limited to this task.\n"
         "Do not commit or push; the orchestrator owns commits.\n"
         "Return compact JSON only. message <= 10 bullets; no full diffs or long logs.\n\n"
-        f"Problem file path: {source}\n\n"
+        f"Task-list/context file path: {source}\n\n"
         "Current task:\n"
         f"{_task_block(task)}\n\n"
         "Compact state summary:\n"
@@ -625,7 +741,7 @@ def _task_prompt(state: RunState, *, review_text: str = "") -> str:
 
 
 def _work_queue_prompt(prompt: str, item: WorkItem, problems_file: Optional[Path]) -> str:
-    source = str(problems_file.expanduser().resolve()) if problems_file else "the problem file"
+    source = str(problems_file.expanduser().resolve()) if problems_file else "the task-list file"
     return (
         f"{prompt}\n\n"
         "WORK QUEUE MODE\n"
@@ -634,7 +750,7 @@ def _work_queue_prompt(prompt: str, item: WorkItem, problems_file: Optional[Path
         "Commit exactly this item as one focused commit; the orchestrator owns the commit.\n"
         "After Agent 2 review is clean, stop. If this item has an unresolved "
         "precondition, return a question or blocked conclusion instead of guessing.\n\n"
-        f"Problem file: {source}\n\n"
+        f"Task-list file: {source}\n\n"
         f"Selected item id: {item.item_id}\n"
         f"Selected item:\n{item.text}"
     )
@@ -1052,7 +1168,7 @@ compatibility problems, and important missing tests.
 Review on two levels:
 
 1. Big-picture fit:
-   - Does this diff address the user's actual request and the problem document?
+   - Does this diff address the user's actual request and task/context document?
    - Is this diff necessary and useful for the stated goal?
    - Did agent 1 solve the right problem, or only make a locally plausible edit?
    - For docs, plans, runbooks, and migrations, is the result concrete enough
@@ -1308,6 +1424,13 @@ def _prepare_branch(repo: Path, *, branch: Optional[str], branch_base: Optional[
     _git(repo, "switch", "-c", branch, base)
 
 
+def _default_task_list_file(log_root: Path, *, run_key: Optional[str]) -> Path:
+    if run_key:
+        return log_root / "state" / "by_key" / f"{_slugify(run_key)}.tasks.md"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return log_root / "state" / "task_lists" / f"{timestamp}_tasks.md"
+
+
 def _squash_current_task_commit(repo: Path, task: Dict[str, Any]) -> Optional[str]:
     base = str(task.get("task_base_commit") or "")
     if not base:
@@ -1363,20 +1486,44 @@ def _discussion_prompt(
         "Produce a normalized Markdown task list suitable for execution mode.\n\n"
         "Each task must be a Markdown checkbox item using this shape:\n"
         "- [ ] T01: Short imperative title\n"
+        "  Status: ready\n"
         "  Problem: ...\n"
         "  Scope: ...\n"
         "  Acceptance: ...\n"
         "  Tests: ...\n"
         "  Out of scope: ...\n"
-        "  Dependencies/Risk: ...\n\n"
+        "  Dependencies/Risk: ...\n"
+        "  Reason: required for any status other than ready/done\n"
+        "  Context: required for any skipped/deferred/failed/needs_user task\n"
+        "  Options: required when user input is needed\n"
+        "  Next action: required for any non-success status\n\n"
         "Rules: make tasks bounded, deduplicate duplicates, preserve distinct "
-        "correctness concerns, and mark user-decision items with [USER TODO]. "
+        "correctness concerns, mark user-decision items with [USER TODO], and "
+        "set user-decision task Status to needs_user. "
         "Return only the task list in message. Set commit_message to "
         "'Write task list'.\n\n"
         f"Context file path: {context_path or '(none)'}\n\n"
         f"Context excerpt:\n{context_text or '(none)'}"
         f"{review_block}"
     )
+
+
+def _mark_discussion_todo_tasks(task_list: str, review_text: str) -> str:
+    task_ids = set(re.findall(r"\bT\d+\b", review_text))
+    if not task_ids:
+        return task_list
+    lines = task_list.splitlines()
+    output: List[str] = []
+    for line in lines:
+        output.append(line)
+        match = re.match(r"^(\s*[-*]\s+\[[ xX]\]\s+)(T\d+)\b", line)
+        if match and match.group(2) in task_ids:
+            output.append("  Status: needs_user")
+            output.append(
+                "  [USER TODO]: Discussion did not converge for this task; "
+                "see the Pre-execution Review Caveats section."
+            )
+    return "\n".join(output)
 
 
 def run_discussion_loop(
@@ -1388,10 +1535,12 @@ def run_discussion_loop(
     plan_reviewer: Any,
     run_log: Any,
     max_rounds: int,
+    allow_partial: bool = False,
 ) -> int:
     context_path, context_text = _read_context_excerpt(context_file)
     review_text = ""
     latest_task_list = ""
+    last_review_text = ""
     for round_index in range(1, max_rounds + 1):
         reply = agent1.ask(
             _discussion_prompt(
@@ -1418,12 +1567,30 @@ def run_discussion_loop(
             context_path=context_path,
         )
         formatted = _format_review(review)
+        last_review_text = formatted
         run_log.add(f"Agent 2 Plan Review {round_index}", formatted)
         print(f"\n[agent 2 plan review {round_index}]\n{formatted}", flush=True)
         if review.status == "clean":
             run_log.add("Result", f"Task list written to `{task_list_file}`.")
             return 0
         review_text = formatted
+    if allow_partial and latest_task_list:
+        latest_task_list = _mark_discussion_todo_tasks(latest_task_list, last_review_text)
+        caveats = (
+            "\n\n## Pre-execution Review Caveats\n\n"
+            "Status: discussion_failed_max_rounds\n\n"
+            "[USER TODO]: Discussion reached the maximum review rounds. Tasks "
+            "named below need user clarification; execution may continue on "
+            "other ready tasks.\n\n"
+            f"{last_review_text.strip()}\n"
+        )
+        task_list_file.write_text(latest_task_list.rstrip() + caveats, encoding="utf-8")
+        run_log.add(
+            "Result",
+            f"Discussion maxed out after {max_rounds} rounds; partial task "
+            f"list with [USER TODO] caveats written to `{task_list_file}`.",
+        )
+        return 0
     raise OrchestrationError(
         f"discussion did not converge after {max_rounds} review rounds; "
         f"latest task list was written to {task_list_file}"
@@ -1535,16 +1702,16 @@ def _combined_prompt(prompt: str, problems_file: Optional[Path]) -> tuple[str, s
         problems_text = resolved.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise OrchestrationError(
-            f"could not read problems document {problems_file}: {exc}"
+            f"could not read task/context document {problems_file}: {exc}"
         ) from exc
     if not problems_text:
-        raise OrchestrationError("problems document is empty")
+        raise OrchestrationError("task/context document is empty")
     combined = (
         f"{prompt}\n\n"
-        "Use the supplied problem document as task context, but do not copy it "
+        "Use the supplied context document as task context, but do not copy it "
         "into your response. Read only the relevant sections needed for the "
         "current request.\n\n"
-        f"Problem file: {resolved}"
+        f"Context file: {resolved}"
     )
     return combined, problems_text
 
@@ -1569,7 +1736,7 @@ def _new_state(
     queue_base_commit = None
     if work_queue:
         if not problems_text:
-            raise OrchestrationError("work queue mode needs a problems document")
+            raise OrchestrationError("work queue mode needs a task-list document")
         tasks = _parse_task_queue(problems_text)
         if work_item is not None:
             wanted = work_item.item_id
@@ -1579,17 +1746,17 @@ def _new_state(
             )
         if current_task_index < 0:
             current_task_index = next(
-                (i for i, task in enumerate(tasks) if task.get("status") != "done"),
+                (i for i, task in enumerate(tasks) if _task_is_executable(task)),
                 -1,
             )
         if current_task_index < 0:
-            raise OrchestrationError("work queue has no unchecked items")
+            raise OrchestrationError("work queue has no executable unfinished tasks")
         tasks[current_task_index]["status"] = "running"
         tasks[current_task_index]["task_base_commit"] = _git(repo, "rev-parse", "HEAD")
         work_item = _task_to_work_item(tasks[current_task_index])
         queue_base_commit = _git(repo, "rev-parse", "HEAD")
         # In queue mode the state and prompts carry only the selected task, not
-        # the full problem document. The parsed compact task list is the durable
+        # the full task/context document. The parsed compact task list is the durable
         # queue state.
         problems_text = ""
         combined = ""
@@ -1678,12 +1845,22 @@ def run_state_loop(
                     next_index = _select_next_task_index(state)
                     if next_index is None:
                         state.phase = "complete"
-                        state.status_message = "All work-queue tasks are complete."
+                        state.status_message = (
+                            "All work-queue tasks are complete."
+                            + (
+                                f" Task list: {state.problems_file}"
+                                if state.problems_file
+                                else ""
+                            )
+                        )
+                        _persist_task_list_status(state)
                         state_store.save(state)
                         return 0
                     _start_work_queue_task(state, repo, next_index)
+                    _persist_task_list_status(state)
                 if not state.pending_prompt:
                     state.pending_prompt = _task_prompt(state)
+                _persist_task_list_status(state)
             # Persist resume intent before the external call. If interrupted,
             # the next invocation resumes the same Claude session and prompt.
             was_started = state.agent1_started
@@ -1799,7 +1976,13 @@ def run_state_loop(
                     state.status_message = (
                         "All work-queue tasks are complete; at least one task "
                         "was skipped with [USER TODO] follow-up."
+                        + (
+                            f" Task list: {state.problems_file}"
+                            if state.problems_file
+                            else ""
+                        )
                     )
+                    _persist_task_list_status(state)
                     state_store.save(state)
                     run_log.add("Result", state.status_message)
                     return 0
@@ -1837,9 +2020,11 @@ def run_state_loop(
                         task["status"] = "done"
                         task["review_round"] = state.review_round
                         task["summary"] = _reply_from_state(state).message
+                        _persist_task_list_status(state)
                     next_index = _select_next_task_index(state)
                     if next_index is not None:
                         _start_work_queue_task(state, repo, next_index)
+                        _persist_task_list_status(state)
                         state.status_message = (
                             f"Task {task.get('id') if task else ''} clean; "
                             f"starting {state.tasks[next_index].get('id')}."
@@ -1848,7 +2033,15 @@ def run_state_loop(
                         run_log.add("Result", state.status_message)
                         continue
                     state.phase = "complete"
-                    state.status_message = "All work-queue tasks are complete."
+                    state.status_message = (
+                        "All work-queue tasks are complete."
+                        + (
+                            f" Task list: {state.problems_file}"
+                            if state.problems_file
+                            else ""
+                        )
+                    )
+                    _persist_task_list_status(state)
                 else:
                     state.phase = "complete"
                     state.status_message = "Agent 2 found no remaining issues."
@@ -1934,11 +2127,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Normalized Markdown task-list checkpoint file",
     )
     parser.add_argument(
-        "--problems-file",
-        type=Path,
-        help="Deprecated alias for --context-file/--task-list-file in legacy paths",
-    )
-    parser.add_argument(
         "--repo",
         type=Path,
         help="Git repository to modify (default: current directory)",
@@ -1946,7 +2134,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--work-queue",
         action="store_true",
-        help="Process exactly one unchecked checkbox item from --problems-file",
+        help="Process task-list items one at a time",
     )
     parser.add_argument(
         "--new-branch",
@@ -2073,33 +2261,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "--commit-policy no-commit is not implemented because Agent 2 "
             "reviews committed ranges"
         )
+    log_root = args.run_log_dir.expanduser().resolve()
+    raw_log_dir = log_root / "raw"
     mode = args.mode
     context_file = args.context_file
     task_list_file = args.task_list_file
-    if mode in {"discussion", "discuss-execute"} and context_file is None:
-        context_file = args.problems_file
-    if mode == "execute" and task_list_file is None:
-        task_list_file = args.problems_file
+    queue_file: Optional[Path] = None
     if mode == "legacy":
+        if args.work_queue:
+            queue_file = task_list_file
         task_list_file = None
     elif mode == "execute":
         args.work_queue = True
         if task_list_file is None:
             raise SystemExit("--mode execute requires --task-list-file")
-        args.problems_file = task_list_file
+        queue_file = task_list_file
     elif mode == "discussion":
         if task_list_file is None:
-            raise SystemExit("--mode discussion requires --task-list-file")
+            task_list_file = _default_task_list_file(log_root, run_key=args.run_key)
+        queue_file = None
     elif mode == "discuss-execute":
-        if task_list_file is None:
-            raise SystemExit("--mode discuss-execute requires --task-list-file")
         if args.auto_execute is False:
             raise SystemExit(
                 "--no-auto-execute is not supported yet for discuss-execute; "
                 "use --mode discussion instead"
             )
+        if task_list_file is None:
+            task_list_file = _default_task_list_file(log_root, run_key=args.run_key)
         args.work_queue = True
-        args.problems_file = task_list_file
+        queue_file = task_list_file
+    else:
+        queue_file = None
     if args.max_rounds <= 0:
         raise SystemExit("--max-rounds must be positive")
     if args.max_dispute_rounds <= 0:
@@ -2108,8 +2300,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise SystemExit("--heartbeat-seconds must be non-negative")
     if args.agent_timeout_minutes <= 0:
         raise SystemExit("--agent-timeout-minutes must be positive")
-    if args.work_queue and not args.problems_file:
-        raise SystemExit("--work-queue requires --problems-file or --task-list-file")
+    if args.work_queue and not queue_file:
+        raise SystemExit("--work-queue requires --task-list-file")
     if args.work_queue and not args.run_key:
         raise SystemExit("--work-queue requires --run-key")
     if args.new_run and not args.run_key:
@@ -2117,8 +2309,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.break_lock and not args.run_key:
         raise SystemExit("--break-lock requires --run-key")
 
-    log_root = args.run_log_dir.expanduser().resolve()
-    raw_log_dir = log_root / "raw"
     state_store = StateStore(log_root / "state", run_key=args.run_key)
     resumed = bool(args.resume or args.resume_last)
     lock = (
@@ -2193,6 +2383,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 plan_reviewer=plan_reviewer,
                 run_log=run_log,
                 max_rounds=args.max_rounds,
+                allow_partial=False,
             )
             run_log.finish(f"Discussion complete. Task list: `{task_list_file}`")
             return result
@@ -2207,72 +2398,109 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             repo = (args.repo or Path.cwd()).expanduser().resolve()
             if not (repo / ".git").exists():
                 raise OrchestrationError(f"not a git repository: {repo}")
+            existing_tasks: List[Dict[str, Any]] = []
+            resolved_task_list = task_list_file.expanduser().resolve()
+            if resolved_task_list.exists():
+                try:
+                    existing_tasks = _parse_task_queue(
+                        resolved_task_list.read_text(encoding="utf-8")
+                    )
+                except OrchestrationError:
+                    existing_tasks = []
+            has_executable = any(_task_is_executable(task) for task in existing_tasks)
+            has_discussion_tasks = any(
+                _task_requires_discussion(task) for task in existing_tasks
+            )
+            should_run_discussion = (
+                not existing_tasks or (not has_executable and has_discussion_tasks)
+            )
             for executable in (args.agent1_command, args.agent2_command):
                 if shutil.which(executable) is None:
                     raise OrchestrationError(
                         f"required executable not found: {executable}"
                     )
-            raw_log_dir.mkdir(parents=True, exist_ok=True)
-            dummy_state = RunState(
-                version=STATE_VERSION,
-                run_id=str(uuid.uuid4()),
-                repo=str(repo),
-                prompt=prompt,
-                problems_file=str(context_file.expanduser().resolve()) if context_file else None,
-                problems_text="",
-                base_commit=_git(repo, "rev-parse", "HEAD"),
-                baseline_untracked=sorted(_untracked_paths(repo)),
-                agent1_session_id=str(uuid.uuid4()),
-                run_key=args.run_key,
-            )
-            discussion_log = RunLog(root=log_root, state=dummy_state, resumed=False)
-            print(f"[orchestrator] Discussion run log: {discussion_log.path}", flush=True)
-            print(f"[orchestrator] Raw logs: {raw_log_dir}", flush=True)
-            raw_log_label = _run_label(dummy_state)
-            agent1 = ClaudeAgent(
-                executable=args.agent1_command,
-                repo=repo,
-                model=args.agent1_model,
-                permission_mode=args.agent1_permission_mode,
-                raw_log_dir=raw_log_dir,
-                raw_log_label=raw_log_label,
-                heartbeat_seconds=args.heartbeat_seconds,
-                timeout_seconds=args.agent_timeout_minutes * 60,
-                session_mode=args.agent1_session_mode,
-            )
-            plan_reviewer = CodexPlanReviewer(
-                executable=args.agent2_command,
-                repo=repo,
-                model=args.agent2_model,
-                raw_log_dir=raw_log_dir,
-                raw_log_label=raw_log_label,
-                heartbeat_seconds=args.heartbeat_seconds,
-                timeout_seconds=args.agent_timeout_minutes * 60,
-            )
-            result = run_discussion_loop(
-                prompt=prompt,
-                context_file=context_file,
-                task_list_file=task_list_file.expanduser().resolve(),
-                agent1=agent1,
-                plan_reviewer=plan_reviewer,
-                run_log=discussion_log,
-                max_rounds=args.max_rounds,
-            )
-            discussion_log.finish(f"Discussion complete. Task list: `{task_list_file}`")
-            if result != 0:
-                return result
+            if should_run_discussion:
+                raw_log_dir.mkdir(parents=True, exist_ok=True)
+                discussion_context = (
+                    resolved_task_list
+                    if existing_tasks and resolved_task_list.exists()
+                    else context_file
+                )
+                discussion_prompt = prompt
+                if existing_tasks:
+                    discussion_prompt = (
+                        f"{prompt}\n\nResume discussion only for tasks marked "
+                        "[USER TODO], needs_user, discussion_failed, or "
+                        "discussion_failed_max_rounds. Do not rewrite clean or "
+                        "ready tasks."
+                    )
+                dummy_state = RunState(
+                    version=STATE_VERSION,
+                    run_id=str(uuid.uuid4()),
+                    repo=str(repo),
+                    prompt=discussion_prompt,
+                    problems_file=str(discussion_context.expanduser().resolve()) if discussion_context else None,
+                    problems_text="",
+                    base_commit=_git(repo, "rev-parse", "HEAD"),
+                    baseline_untracked=sorted(_untracked_paths(repo)),
+                    agent1_session_id=str(uuid.uuid4()),
+                    run_key=args.run_key,
+                )
+                discussion_log = RunLog(root=log_root, state=dummy_state, resumed=False)
+                print(f"[orchestrator] Discussion run log: {discussion_log.path}", flush=True)
+                print(f"[orchestrator] Raw logs: {raw_log_dir}", flush=True)
+                raw_log_label = _run_label(dummy_state)
+                agent1 = ClaudeAgent(
+                    executable=args.agent1_command,
+                    repo=repo,
+                    model=args.agent1_model,
+                    permission_mode=args.agent1_permission_mode,
+                    raw_log_dir=raw_log_dir,
+                    raw_log_label=raw_log_label,
+                    heartbeat_seconds=args.heartbeat_seconds,
+                    timeout_seconds=args.agent_timeout_minutes * 60,
+                    session_mode=args.agent1_session_mode,
+                )
+                plan_reviewer = CodexPlanReviewer(
+                    executable=args.agent2_command,
+                    repo=repo,
+                    model=args.agent2_model,
+                    raw_log_dir=raw_log_dir,
+                    raw_log_label=raw_log_label,
+                    heartbeat_seconds=args.heartbeat_seconds,
+                    timeout_seconds=args.agent_timeout_minutes * 60,
+                )
+                result = run_discussion_loop(
+                    prompt=discussion_prompt,
+                    context_file=discussion_context,
+                    task_list_file=resolved_task_list,
+                    agent1=agent1,
+                    plan_reviewer=plan_reviewer,
+                    run_log=discussion_log,
+                    max_rounds=args.max_rounds,
+                    allow_partial=True,
+                )
+                discussion_log.finish(f"Discussion complete. Task list: `{task_list_file}`")
+                if result != 0:
+                    return result
+            else:
+                print(
+                    f"[orchestrator] Existing task list has ready work; "
+                    f"skipping discussion: {resolved_task_list}",
+                    flush=True,
+                )
             # Fall through into execution using the generated task list.
-            args.problems_file = task_list_file.expanduser().resolve()
+            queue_file = resolved_task_list
         if args.resume:
-            if prompt_arg or args.problems_file:
+            if prompt_arg or queue_file:
                 raise OrchestrationError(
-                    "a resumed run cannot accept a new prompt or problems file"
+                    "a resumed run cannot accept a new prompt or task-list file"
                 )
             state = state_store.load(args.resume)
         elif args.resume_last:
-            if prompt_arg or args.problems_file:
+            if prompt_arg or queue_file:
                 raise OrchestrationError(
-                    "a resumed run cannot accept a new prompt or problems file"
+                    "a resumed run cannot accept a new prompt or task-list file"
                 )
             state = state_store.load_latest_incomplete()
         else:
@@ -2291,10 +2519,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     branch_base=args.branch_base,
                 )
             problems_path = (
-                args.problems_file.expanduser().resolve()
-                if args.problems_file
+                queue_file.expanduser().resolve()
+                if queue_file
                 else None
             )
+            if args.work_queue and problems_path and problems_path.exists():
+                parsed_tasks = _parse_task_queue(problems_path.read_text(encoding="utf-8"))
+                if not any(_task_is_executable(task) for task in parsed_tasks):
+                    print(
+                        "[orchestrator] Task list has no executable unfinished "
+                        f"tasks. Summary: {_task_queue_summary(parsed_tasks)}. "
+                        f"Task list: {problems_path}",
+                        flush=True,
+                    )
+                    return 0
             if args.run_key and state_store.has_key(args.run_key) and not args.new_run:
                 existing = state_store.load_by_key(args.run_key)
                 if not _terminal_phase(existing.phase):
@@ -2305,7 +2543,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         )
                     if existing.problems_file != (str(problems_path) if problems_path else None):
                         raise OrchestrationError(
-                            "existing incomplete keyed run uses a different problems file; "
+                            "existing incomplete keyed run uses a different task-list file; "
                             "use the same command, --resume, --new-run, or a new --run-key"
                         )
                     state = existing

@@ -533,7 +533,7 @@ def test_work_queue_main_processes_all_items_in_one_invocation(repo: Path, tmp_p
         "Implement queue",
         "--repo",
         str(repo),
-        "--problems-file",
+        "--task-list-file",
         str(queue),
         "--work-queue",
         "--run-key",
@@ -610,6 +610,60 @@ def test_execute_mode_uses_task_list_file(repo: Path, tmp_path: Path):
     assert _git(repo, "log", "-1", "--pretty=%s") == "Implement task-list item"
 
 
+def test_task_queue_skips_needs_user_and_runs_ready(repo: Path, tmp_path: Path):
+    queue = tmp_path / "tasks.md"
+    queue.write_text(
+        "- [ ] T01: Needs decision\n"
+        "  Status: needs_user\n"
+        "  [USER TODO]: choose a policy.\n"
+        "- [ ] T02: Ready work\n"
+        "  Status: ready\n"
+        "  Problem: tracked.txt needs a value.\n"
+    )
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="status-test",
+        work_queue=True,
+    )
+
+    assert state.work_item_id == "T02-Ready-work"
+    assert state.tasks[0]["status"] == "needs_user"
+    assert state.tasks[1]["status"] == "running"
+
+
+def test_work_queue_with_only_non_executable_tasks_exits_clean(repo: Path, tmp_path: Path):
+    queue = tmp_path / "tasks.md"
+    queue.write_text(
+        "- [ ] T01: Needs decision\n"
+        "  Status: needs_user\n"
+        "  [USER TODO]: choose a policy.\n"
+    )
+
+    result = agent_loop.main([
+        "--prompt",
+        "Implement queue",
+        "--repo",
+        str(repo),
+        "--task-list-file",
+        str(queue),
+        "--work-queue",
+        "--run-key",
+        "no-executable-test",
+        "--run-log-dir",
+        str(tmp_path / "logs"),
+        "--agent1-command",
+        sys.executable,
+        "--agent2-command",
+        sys.executable,
+        "--heartbeat-seconds",
+        "0",
+    ])
+
+    assert result == 0
+
+
 def test_discussion_mode_writes_reviewed_task_list(repo: Path, tmp_path: Path):
     output = tmp_path / "tasks.md"
     context = tmp_path / "context.md"
@@ -657,6 +711,73 @@ def test_discussion_mode_writes_reviewed_task_list(repo: Path, tmp_path: Path):
 
     assert result == 0
     assert output.read_text().startswith("- [ ] T01: Fix tracked value")
+
+
+def test_discuss_execute_defaults_task_list_under_run_key(repo: Path, tmp_path: Path):
+    context = tmp_path / "context.md"
+    context.write_text("Finding: tracked.txt needs a bounded task.\n")
+    fake_claude = tmp_path / "fake_claude.py"
+    fake_claude.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, pathlib, sys\n"
+        "prompt = sys.argv[-1]\n"
+        "if 'DISCUSSION MODE' in prompt:\n"
+        "    message = '- [ ] T01: Fix tracked value\\\\n  Problem: tracked.txt needs a value.\\\\n  Acceptance: tracked.txt says executed.'\n"
+        "    commit_message = 'Write task list'\n"
+        "else:\n"
+        "    pathlib.Path('tracked.txt').write_text('executed\\n')\n"
+        "    message = 'implemented generated task'\n"
+        "    commit_message = 'Implement generated task'\n"
+        "print(json.dumps({'status':'conclusion','message':message,'commit_message':commit_message}))\n"
+    )
+    fake_claude.chmod(0o755)
+    fake_codex = tmp_path / "fake_codex.py"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+        "open(out, 'w').write(json.dumps({'status':'clean','summary':'ok','issues':[]}))\n"
+    )
+    fake_codex.chmod(0o755)
+
+    result = agent_loop.main([
+        "--mode",
+        "discuss-execute",
+        "--prompt",
+        "Create and run tasks",
+        "--repo",
+        str(repo),
+        "--context-file",
+        str(context),
+        "--run-key",
+        "generated-tasks",
+        "--run-log-dir",
+        str(tmp_path / "logs"),
+        "--agent1-command",
+        str(fake_claude),
+        "--agent2-command",
+        str(fake_codex),
+        "--heartbeat-seconds",
+        "0",
+    ])
+
+    generated = tmp_path / "logs" / "state" / "by_key" / "generated-tasks.tasks.md"
+    assert result == 0
+    assert generated.exists()
+    assert "- [x] T01: Fix tracked value" in generated.read_text()
+    assert "Status: done" in generated.read_text()
+    assert (repo / "tracked.txt").read_text() == "executed\n"
+
+
+def test_prepare_branch_creates_or_switches_without_breaking(repo: Path):
+    initial_branch = _git(repo, "branch", "--show-current")
+    agent_loop._prepare_branch(repo, branch="feature/test", branch_base=None)
+    assert _git(repo, "branch", "--show-current") == "feature/test"
+    subprocess.run(["git", "switch", initial_branch, "-q"], cwd=repo, check=True)
+
+    agent_loop._prepare_branch(repo, branch="feature/test", branch_base=None)
+
+    assert _git(repo, "branch", "--show-current") == "feature/test"
 
 
 def test_parser_accepts_new_branch_and_legacy_branch_alias():
