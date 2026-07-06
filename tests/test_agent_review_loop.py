@@ -361,6 +361,170 @@ def test_agent1_review_base_overrides_starting_base(repo: Path):
     assert reviewer.range[0] != stale_start
 
 
+def test_fake_full_sha_is_rejected(repo: Path):
+    fake_sha = "67a007053a86fc70a5b7e2c62d0e5b3c4b9c9d1e"
+    reply = agent_loop.Agent1Reply(
+        "conclusion",
+        "done",
+        "Do it",
+        review_base=fake_sha,
+    )
+
+    with pytest.raises(agent_loop.OrchestrationError, match="invalid review base"):
+        agent_loop._resolve_review_base(repo, reply, "HEAD")
+
+
+def test_work_queue_commit_range_ignores_agent_reported_range(
+    repo: Path,
+    tmp_path: Path,
+):
+    queue = tmp_path / "queue.md"
+    queue.write_text(
+        "- [ ] T01: fix one thing\n"
+        "  Scope: tracked.txt only.\n"
+    )
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="range-test",
+        work_queue=True,
+    )
+
+    class CapturingStateStore:
+        def __init__(self):
+            self.saved = None
+
+        def save(self, value):
+            self.saved = value
+
+        def load(self, _run_id):
+            return self.saved
+
+    class CapturingRunLog:
+        def add(self, _title, _text):
+            pass
+
+    fake_sha = "67a007053a86fc70a5b7e2c62d0e5b3c4b9c9d1e"
+
+    class FakeAgent:
+        def ask(self, _prompt):
+            (repo / "tracked.txt").write_text("fixed\n")
+            return agent_loop.Agent1Reply(
+                "conclusion",
+                "Implemented task.",
+                "Implement task",
+                review_base=fake_sha,
+                review_head=fake_sha,
+            )
+
+    class CleanReviewer:
+        def __init__(self):
+            self.range = None
+
+        def review(self, **kwargs):
+            self.range = (kwargs["base_commit"], kwargs["commit"])
+            return agent_loop.ReviewReply("clean", "No issues.", [])
+
+    store = CapturingStateStore()
+    store.save(state)
+    reviewer = CleanReviewer()
+    base_commit = _git(repo, "rev-parse", "HEAD")
+
+    result = agent_loop.run_state_loop(
+        state=state,
+        state_store=store,
+        run_log=CapturingRunLog(),
+        agent1=FakeAgent(),
+        reviewer=reviewer,
+        max_rounds=3,
+        max_dispute_rounds=3,
+    )
+
+    assert result == 0
+    assert reviewer.range is not None
+    assert reviewer.range[0] == base_commit
+    assert reviewer.range[1] == _git(repo, "rev-parse", "HEAD")
+    assert reviewer.range[1] != fake_sha
+
+
+def test_work_queue_resume_after_commit_uses_stored_commit_range(
+    repo: Path,
+    tmp_path: Path,
+):
+    queue = tmp_path / "queue.md"
+    queue.write_text(
+        "- [ ] T01: fix one thing\n"
+        "  Scope: tracked.txt only.\n"
+    )
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="resume-range-test",
+        work_queue=True,
+    )
+    base_commit = _git(repo, "rev-parse", "HEAD")
+    (repo / "tracked.txt").write_text("fixed before crash\n")
+    subprocess.run(["git", "commit", "-am", "fixed before crash", "-q"], cwd=repo, check=True)
+    committed_head = _git(repo, "rev-parse", "HEAD")
+    fake_sha = "67a007053a86fc70a5b7e2c62d0e5b3c4b9c9d1e"
+    state.phase = "commit"
+    state.commit = committed_head
+    state.reply = {
+        "status": "conclusion",
+        "message": "Implemented task.",
+        "commit_message": "Implement task",
+        "review_base": fake_sha,
+        "review_head": fake_sha,
+        "target_branch": "",
+        "work_branch": "",
+    }
+
+    class CapturingStateStore:
+        def __init__(self):
+            self.saved = None
+
+        def save(self, value):
+            self.saved = value
+
+        def load(self, _run_id):
+            return self.saved
+
+    class CapturingRunLog:
+        def add(self, _title, _text):
+            pass
+
+    class UnusedAgent:
+        def ask(self, _prompt):
+            raise AssertionError("resume should not call Agent 1 again")
+
+    class CleanReviewer:
+        def __init__(self):
+            self.range = None
+
+        def review(self, **kwargs):
+            self.range = (kwargs["base_commit"], kwargs["commit"])
+            return agent_loop.ReviewReply("clean", "No issues.", [])
+
+    store = CapturingStateStore()
+    store.save(state)
+    reviewer = CleanReviewer()
+
+    result = agent_loop.run_state_loop(
+        state=state,
+        state_store=store,
+        run_log=CapturingRunLog(),
+        agent1=UnusedAgent(),
+        reviewer=reviewer,
+        max_rounds=3,
+        max_dispute_rounds=3,
+    )
+
+    assert result == 0
+    assert reviewer.range == (base_commit, committed_head)
+
+
 def test_blocked_review_stops_before_agent1_fix(repo: Path):
     class FakeAgent:
         def __init__(self):

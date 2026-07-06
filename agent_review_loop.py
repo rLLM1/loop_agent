@@ -1667,7 +1667,7 @@ def _review_is_blocked(review: ReviewReply) -> bool:
 def _resolve_review_base(repo: Path, reply: Agent1Reply, fallback: str) -> str:
     candidate = reply.review_base or fallback
     try:
-        return _git(repo, "rev-parse", candidate)
+        return _git(repo, "rev-parse", "--verify", f"{candidate}^{{commit}}")
     except OrchestrationError as exc:
         raise OrchestrationError(
             f"Agent 1 provided invalid review base {candidate!r}: {exc}"
@@ -1677,11 +1677,18 @@ def _resolve_review_base(repo: Path, reply: Agent1Reply, fallback: str) -> str:
 def _resolve_review_head(repo: Path, reply: Agent1Reply, fallback: str) -> str:
     candidate = reply.review_head or fallback
     try:
-        return _git(repo, "rev-parse", candidate)
+        return _git(repo, "rev-parse", "--verify", f"{candidate}^{{commit}}")
     except OrchestrationError as exc:
         raise OrchestrationError(
             f"Agent 1 provided invalid review head {candidate!r}: {exc}"
         ) from exc
+
+
+def _resolve_commit(repo: Path, candidate: str, label: str) -> str:
+    try:
+        return _git(repo, "rev-parse", "--verify", f"{candidate}^{{commit}}")
+    except OrchestrationError as exc:
+        raise OrchestrationError(f"invalid {label} {candidate!r}: {exc}") from exc
 
 
 def _validate_review_range(repo: Path, base: str, head: str) -> None:
@@ -1914,18 +1921,33 @@ def run_state_loop(
             if task is not None and state.commit:
                 task["last_commit"] = state.commit
                 task["summary"] = reply.message
-            review_base = _resolve_review_base(
-                repo,
-                reply,
-                (task.get("task_base_commit") if task else None)
-                or state.review_base
-                or state.base_commit,
-            )
-            review_head = _resolve_review_head(
-                repo,
-                reply,
-                state.commit or state.base_commit,
-            )
+            task_review_base = ""
+            if task is not None:
+                task_review_base = str(task.get("task_base_commit") or state.base_commit)
+            if task is not None and state.commit:
+                review_base = _resolve_commit(
+                    repo,
+                    task_review_base,
+                    "task review base",
+                )
+                review_head = _resolve_commit(
+                    repo,
+                    state.commit,
+                    "orchestrator-managed review head",
+                )
+            else:
+                review_base = _resolve_review_base(
+                    repo,
+                    reply,
+                    (task.get("task_base_commit") if task else None)
+                    or state.review_base
+                    or state.base_commit,
+                )
+                review_head = _resolve_review_head(
+                    repo,
+                    reply,
+                    state.commit or state.base_commit,
+                )
             _validate_review_range(repo, review_base, review_head)
             state.review_base = review_base
             state.review_head = review_head
