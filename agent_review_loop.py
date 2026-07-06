@@ -144,6 +144,22 @@ NON_EXECUTABLE_TASK_STATUSES = {
     "not_applicable",
 }
 
+TASK_MEMORY_FIELDS = (
+    "resolved_decisions",
+    "constraints",
+    "rejected_approaches",
+    "known_test_results",
+    "open_review_findings",
+)
+
+TASK_MEMORY_LIMITS = {
+    "resolved_decisions": 5,
+    "constraints": 5,
+    "rejected_approaches": 3,
+    "known_test_results": 5,
+    "open_review_findings": 3,
+}
+
 
 @dataclass
 class RunState:
@@ -490,6 +506,7 @@ def _work_item_to_task(item: WorkItem) -> Dict[str, Any]:
         "last_commit": "",
         "review_round": 1,
         "summary": "",
+        "task_memory": _extract_task_memory_from_text(item.text),
     }
 
 
@@ -591,6 +608,150 @@ def _upsert_status_line(body: str, status: str) -> str:
     return "\n".join([lines[0], f"  Status: {status}", *lines[1:]])
 
 
+def _empty_task_memory() -> Dict[str, List[str]]:
+    return {field: [] for field in TASK_MEMORY_FIELDS}
+
+
+def _clean_memory_item(text: str, *, max_len: int = 260) -> str:
+    value = re.sub(r"\s+", " ", text.strip().lstrip("-*0123456789. ")).strip()
+    if len(value) > max_len:
+        value = value[: max_len - 3].rstrip() + "..."
+    return value
+
+
+def _normalize_task_memory(value: Any) -> Dict[str, List[str]]:
+    memory = _empty_task_memory()
+    if not isinstance(value, dict):
+        return memory
+    for field in TASK_MEMORY_FIELDS:
+        raw_items = value.get(field, [])
+        if isinstance(raw_items, str):
+            raw_items = [raw_items]
+        if not isinstance(raw_items, list):
+            continue
+        seen = set()
+        items: List[str] = []
+        for raw in raw_items:
+            item = _clean_memory_item(str(raw))
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            items.append(item)
+        memory[field] = items[-TASK_MEMORY_LIMITS[field]:]
+    return memory
+
+
+def _memory_add(task: Dict[str, Any], field: str, items: Sequence[str]) -> None:
+    if field not in TASK_MEMORY_FIELDS:
+        return
+    memory = _normalize_task_memory(task.get("task_memory"))
+    existing = list(memory[field])
+    seen = set(existing)
+    for raw in items:
+        item = _clean_memory_item(raw)
+        if not item or item in seen:
+            continue
+        existing.append(item)
+        seen.add(item)
+    memory[field] = existing[-TASK_MEMORY_LIMITS[field]:]
+    task["task_memory"] = memory
+
+
+def _memory_replace(task: Dict[str, Any], field: str, items: Sequence[str]) -> None:
+    if field not in TASK_MEMORY_FIELDS:
+        return
+    memory = _normalize_task_memory(task.get("task_memory"))
+    cleaned: List[str] = []
+    seen = set()
+    for raw in items:
+        item = _clean_memory_item(raw)
+        if not item or item in seen:
+            continue
+        cleaned.append(item)
+        seen.add(item)
+    memory[field] = cleaned[-TASK_MEMORY_LIMITS[field]:]
+    task["task_memory"] = memory
+
+
+def _extract_task_memory_from_text(text: str) -> Dict[str, List[str]]:
+    memory = _empty_task_memory()
+    mapping = {
+        "out of scope": "constraints",
+        "dependencies/risk": "constraints",
+        "acceptance": "constraints",
+        "tests": "known_test_results",
+    }
+    for line in text.splitlines():
+        match = re.match(r"\s*([A-Za-z /_-]+)\s*:\s*(.+)$", line)
+        if not match:
+            continue
+        key = match.group(1).strip().lower()
+        value = match.group(2).strip()
+        field = mapping.get(key)
+        if field:
+            memory[field].append(_clean_memory_item(f"{match.group(1).strip()}: {value}"))
+    return _normalize_task_memory(memory)
+
+
+def _extract_agent1_memory(reply: Agent1Reply, commit: Optional[str]) -> Dict[str, List[str]]:
+    memory = _empty_task_memory()
+    if commit:
+        memory["resolved_decisions"].append(f"Committed {commit[:12]}: {reply.commit_message}")
+    for line in reply.message.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lower = stripped.lower()
+        if lower.startswith(("test", "tests", "pytest")) or " passed" in lower:
+            memory["known_test_results"].append(stripped)
+        elif "out of scope" in lower or "constraint" in lower or "kept" in lower:
+            memory["constraints"].append(stripped)
+        elif "rejected" in lower or "did not" in lower or "no change" in lower:
+            memory["rejected_approaches"].append(stripped)
+        elif stripped.startswith(("-", "*")):
+            memory["resolved_decisions"].append(stripped)
+    return _normalize_task_memory(memory)
+
+
+def _review_issue_memory(review: ReviewReply) -> List[str]:
+    items = []
+    for issue in review.issues[: TASK_MEMORY_LIMITS["open_review_findings"]]:
+        severity = str(issue.get("severity") or "issue")
+        title = str(issue.get("title") or "").strip()
+        details = str(issue.get("details") or "").strip()
+        text = f"[{severity}] {title}: {details}" if title else f"[{severity}] {details}"
+        items.append(text)
+    return items
+
+
+def _format_task_memory(task: Dict[str, Any]) -> str:
+    memory = _normalize_task_memory(task.get("task_memory"))
+    if not any(memory.values()):
+        return "(none)"
+    labels = {
+        "resolved_decisions": "Resolved decisions",
+        "constraints": "Constraints",
+        "rejected_approaches": "Rejected approaches",
+        "known_test_results": "Known test results",
+        "open_review_findings": "Open review findings",
+    }
+    lines: List[str] = []
+    for field in TASK_MEMORY_FIELDS:
+        items = memory[field]
+        if not items:
+            continue
+        lines.append(f"{labels[field]}:")
+        lines.extend(f"- {item}" for item in items)
+    return "\n".join(lines)
+
+
+def _render_task_memory_for_file(task: Dict[str, Any]) -> List[str]:
+    memory_text = _format_task_memory(task)
+    if memory_text == "(none)":
+        return []
+    return ["  Task memory:", *[f"    {line}" for line in memory_text.splitlines()]]
+
+
 def _persist_task_list_status(state: RunState) -> None:
     if not state.work_queue or not state.problems_file or not state.tasks:
         return
@@ -621,6 +782,7 @@ def _persist_task_list_status(state: RunState) -> None:
         if task.get("summary"):
             summary = " ".join(str(task.get("summary")).split())
             lines.append(f"  Last summary: {summary[:500]}")
+        lines.extend(_render_task_memory_for_file(task))
         lines.append("")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -633,6 +795,7 @@ def _start_work_queue_task(state: RunState, repo: Path, index: int) -> None:
     task["task_base_commit"] = _git(repo, "rev-parse", "HEAD")
     task["review_round"] = 1
     task["last_commit"] = ""
+    task["task_memory"] = _normalize_task_memory(task.get("task_memory"))
     state.work_item_id = str(task.get("id"))
     state.work_item_title = str(task.get("title"))
     state.work_item_text = str(task.get("text"))
@@ -671,6 +834,9 @@ def _skip_current_work_queue_task(
     task["status"] = "skipped"
     task["review_round"] = state.review_round
     task["summary"] = reason
+    _memory_add(task, "constraints", [f"[USER TODO] skipped: {reason}"])
+    if state.review:
+        _memory_replace(task, "open_review_findings", _review_issue_memory(_review_from_state(state)))
     task_id = str(task.get("id") or task.get("title") or "current task")
     message = f"[USER TODO] {task_id} skipped: {reason}"
     state.state_summary = (
@@ -734,6 +900,8 @@ def _task_prompt(state: RunState, *, review_text: str = "") -> str:
         f"Task-list/context file path: {source}\n\n"
         "Current task:\n"
         f"{_task_block(task)}\n\n"
+        "Compact task memory from prior A/B rounds:\n"
+        f"{_format_task_memory(task)}\n\n"
         "Compact state summary:\n"
         f"{_compact_state_summary(state)}"
         f"{extra}"
@@ -1921,6 +2089,9 @@ def run_state_loop(
             if task is not None and state.commit:
                 task["last_commit"] = state.commit
                 task["summary"] = reply.message
+                agent1_memory = _extract_agent1_memory(reply, state.commit)
+                for field, items in agent1_memory.items():
+                    _memory_add(task, field, items)
             task_review_base = ""
             if task is not None:
                 task_review_base = str(task.get("task_base_commit") or state.base_commit)
@@ -2033,6 +2204,12 @@ def run_state_loop(
                 if state.work_queue:
                     task = _current_task(state)
                     if task is not None:
+                        _memory_replace(task, "open_review_findings", [])
+                        _memory_add(
+                            task,
+                            "known_test_results",
+                            [f"Agent 2 review round {state.review_round}: clean"],
+                        )
                         if commit_policy == "squash-per-task":
                             squashed = _squash_current_task_commit(repo, task)
                             if squashed:
@@ -2080,6 +2257,10 @@ def run_state_loop(
                 run_log.add("Result", state.status_message)
                 return 2
 
+            if state.work_queue:
+                task = _current_task(state)
+                if task is not None:
+                    _memory_replace(task, "open_review_findings", _review_issue_memory(review))
             state.agent_mode = "fix"
             state.pending_prompt = (
                 _task_prompt(state, review_text=review_text)

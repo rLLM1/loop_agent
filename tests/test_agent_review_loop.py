@@ -525,6 +525,141 @@ def test_work_queue_resume_after_commit_uses_stored_commit_range(
     assert reviewer.range == (base_commit, committed_head)
 
 
+def test_work_queue_task_memory_survives_into_later_fix_prompt(
+    repo: Path,
+    tmp_path: Path,
+):
+    queue = tmp_path / "queue.md"
+    queue.write_text(
+        "- [ ] T01: preserve decisions\n"
+        "  Scope: tracked.txt only.\n"
+        "  Out of scope: later tasks.\n"
+        "  Tests: focused regression.\n"
+    )
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="memory-test",
+        work_queue=True,
+    )
+
+    class CapturingStateStore:
+        def __init__(self):
+            self.saved = None
+
+        def save(self, value):
+            self.saved = value
+
+        def load(self, _run_id):
+            return self.saved
+
+    class CapturingRunLog:
+        def add(self, _title, _text):
+            pass
+
+    class FakeAgent:
+        def __init__(self):
+            self.calls = 0
+            self.prompts = []
+
+        def ask(self, prompt):
+            self.calls += 1
+            self.prompts.append(prompt)
+            if self.calls == 1:
+                (repo / "tracked.txt").write_text("first\n")
+                return agent_loop.Agent1Reply(
+                    "conclusion",
+                    "- Kept the public API unchanged.\n"
+                    "Tests: focused regression passed.",
+                    "First fix",
+                )
+            (repo / "tracked.txt").write_text("second\n")
+            return agent_loop.Agent1Reply(
+                "conclusion",
+                "- Rejected broad refactor; fixed only the reviewed issue.\n"
+                "Tests: focused regression passed again.",
+                "Second fix",
+            )
+
+    class IssuesThenCleanReviewer:
+        def __init__(self):
+            self.calls = 0
+
+        def review(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return agent_loop.ReviewReply(
+                    "issues",
+                    "One actionable issue.",
+                    [{
+                        "severity": "high",
+                        "title": "Missing propagation",
+                        "details": "tracked.txt:1 does not propagate the value.",
+                    }],
+                )
+            return agent_loop.ReviewReply("clean", "No issues.", [])
+
+    store = CapturingStateStore()
+    store.save(state)
+    agent = FakeAgent()
+    result = agent_loop.run_state_loop(
+        state=state,
+        state_store=store,
+        run_log=CapturingRunLog(),
+        agent1=agent,
+        reviewer=IssuesThenCleanReviewer(),
+        max_rounds=3,
+        max_dispute_rounds=3,
+    )
+
+    saved = store.load(state.run_id)
+    task = saved.tasks[0]
+    assert result == 0
+    assert agent.calls == 2
+    assert "Compact task memory from prior A/B rounds" in agent.prompts[1]
+    assert "Kept the public API unchanged" in agent.prompts[1]
+    assert "focused regression passed" in agent.prompts[1]
+    assert "Missing propagation" in agent.prompts[1]
+    assert task["status"] == "done"
+    assert task["task_memory"]["open_review_findings"] == []
+    assert any(
+        "Agent 2 review round 2: clean" in item
+        for item in task["task_memory"]["known_test_results"]
+    )
+
+
+def test_task_list_persists_compact_task_memory(repo: Path, tmp_path: Path):
+    queue = tmp_path / "queue.md"
+    queue.write_text(
+        "- [ ] T01: persist memory\n"
+        "  Scope: tracked.txt only.\n"
+    )
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="memory-render-test",
+        work_queue=True,
+    )
+    task = state.tasks[0]
+    agent_loop._memory_add(task, "resolved_decisions", ["Committed abc123: keep API"])
+    agent_loop._memory_replace(
+        task,
+        "open_review_findings",
+        ["[high] Missing propagation: tracked.txt:1"],
+    )
+
+    agent_loop._persist_task_list_status(state)
+
+    rendered = queue.read_text()
+    assert "Task memory:" in rendered
+    assert "Resolved decisions:" in rendered
+    assert "Committed abc123: keep API" in rendered
+    assert "Open review findings:" in rendered
+    assert "Missing propagation" in rendered
+
+
 def test_blocked_review_stops_before_agent1_fix(repo: Path):
     class FakeAgent:
         def __init__(self):
