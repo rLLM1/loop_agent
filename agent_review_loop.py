@@ -876,8 +876,16 @@ def _commit_summary_from_value(value: Dict[str, Any]) -> CommitSummary:
         status_values={"commit_summary"},
         text_fields={"final_commit_subject", "final_commit_body"},
     )
+    subject = value["final_commit_subject"].strip()
+    if not subject:
+        # A schema-valid but empty/whitespace-only subject would otherwise land
+        # as the squashed commit message; treat it as a summary failure so the
+        # caller degrades to the deterministic fallback.
+        raise OrchestrationError(
+            "agent field 'final_commit_subject' must be non-empty"
+        )
     return CommitSummary(
-        final_commit_subject=value["final_commit_subject"],
+        final_commit_subject=subject,
         final_commit_body=value["final_commit_body"],
     )
 
@@ -1928,25 +1936,164 @@ def _default_task_list_file(log_root: Path, *, run_key: Optional[str]) -> Path:
     return log_root / "state" / "task_lists" / f"{timestamp}_tasks.md"
 
 
-def _squash_current_task_commit(repo: Path, task: Dict[str, Any]) -> Optional[str]:
+def _task_needs_commit_summary(repo: Path, task: Dict[str, Any]) -> bool:
+    """True when the current task has multiple commits to squash and summarize.
+
+    Only a genuine multi-commit range is routed through the crash-safe
+    commit-summary phase. Single-commit (or no-commit) tasks keep Agent 1's
+    original subject/body and never run the final Agent 2 summary pass (T08).
+    """
     base = str(task.get("task_base_commit") or "")
     if not base:
-        return None
+        return False
     head = _git(repo, "rev-parse", "HEAD")
     if head == base:
-        return head
-    count_text = _git(repo, "rev-list", "--count", f"{base}..HEAD")
+        return False
     try:
-        count = int(count_text)
+        count = int(_git(repo, "rev-list", "--count", f"{base}..HEAD"))
     except ValueError:
         count = 1
-    if count <= 1:
-        return head
-    subjects = _git(repo, "log", "--reverse", "--format=%s", f"{base}..HEAD").splitlines()
-    subject = subjects[0] if subjects else str(task.get("title") or "Implement task")
-    _git(repo, "reset", "--soft", base)
-    _git(repo, "commit", "-m", subject)
-    return _git(repo, "rev-parse", "HEAD")
+    return count > 1
+
+
+def _commit_message_args(summary: CommitSummary) -> List[str]:
+    """Build the ``git commit-tree`` message flags for a commit summary.
+
+    The subject is always passed; the body is added as a second ``-m`` only when
+    it carries non-whitespace content, so an empty fallback body does not append
+    a blank paragraph.
+    """
+    args = ["-m", summary.final_commit_subject]
+    if (summary.final_commit_body or "").strip():
+        args.extend(["-m", summary.final_commit_body])
+    return args
+
+
+def _commit_summary_or_fallback(
+    *,
+    reviewer: Any,
+    repo: Path,
+    task: Dict[str, Any],
+    base: str,
+    head: str,
+    run_log: Any,
+) -> CommitSummary:
+    """Return the Agent 2 commit summary, degrading to the deterministic fallback.
+
+    Any failure of the reviewer summary pass (exec error, bad JSON, missing
+    fields, or a reviewer without the method) falls back to
+    ``_fallback_commit_summary`` built from Agent 1's recorded facts alone, so
+    the squash always has an informative, non-empty message.
+    """
+    task_commit_log = list(task.get("task_commit_log") or [])
+    try:
+        return reviewer.summarize_commit(
+            base_commit=base,
+            head_commit=head,
+            task_commit_log=task_commit_log,
+            recorded_tests=_recorded_tests_for_summary(task),
+        )
+    except Exception as exc:  # noqa: BLE001 - any summary failure must degrade
+        run_log.add(
+            "Commit summary",
+            f"Agent 2 commit-summary pass failed ({exc}); using deterministic "
+            "fallback from Agent 1 facts.",
+        )
+        return _fallback_commit_summary(task_commit_log)
+
+
+def _summarize_and_squash_current_task(
+    *,
+    state: RunState,
+    repo: Path,
+    reviewer: Any,
+    run_log: Any,
+) -> None:
+    """Squash the current multi-commit task into one summarized commit.
+
+    Idempotent and crash-safe. The caller persists ``phase="commit_summary"``
+    before invoking this and persists the result immediately after. On entry
+    HEAD is either the multi-commit task tip (needs squashing) or, on a resumed
+    run whose squash already landed, the single squashed commit. Either way the
+    task ends as exactly one commit and ``state.commit``/``state.review_head``/
+    ``task['last_commit']`` are updated to it.
+
+    The squash uses ``commit-tree`` + ``reset --soft`` so the only history
+    mutation is a single ref move: a crash before it leaves the multi-commit tip
+    (count > 1, re-squashed on resume); a crash after it leaves the squashed
+    commit (count == 1, not re-squashed on resume).
+    """
+    task = _current_task(state)
+    base = str((task or {}).get("task_base_commit") or "")
+    head = _git(repo, "rev-parse", "HEAD")
+    count = 0
+    if base and head != base:
+        try:
+            count = int(_git(repo, "rev-list", "--count", f"{base}..HEAD"))
+        except ValueError:
+            count = 1
+
+    if base and count > 1:
+        summary = _commit_summary_or_fallback(
+            reviewer=reviewer,
+            repo=repo,
+            task=task or {},
+            base=base,
+            head=head,
+            run_log=run_log,
+        )
+        tree = _git(repo, "rev-parse", "HEAD^{tree}")
+        new_commit = _git(
+            repo, "commit-tree", tree, "-p", base, *_commit_message_args(summary)
+        )
+        _git(repo, "reset", "--soft", new_commit)
+        head = _git(repo, "rev-parse", "HEAD")
+
+    state.commit = head
+    state.review_head = head
+    if task is not None:
+        task["last_commit"] = head
+
+
+def _finalize_clean_work_queue_task_and_advance(
+    *,
+    state: RunState,
+    repo: Path,
+    run_log: Any,
+    state_store: Any,
+) -> Optional[int]:
+    """Mark the current work-queue task done and advance to the next task.
+
+    Returns ``None`` when the caller should continue the loop (another task was
+    started) or an exit code when the whole queue is finished. Shared by the
+    plain clean-review path and the commit-summary phase so both finish a task
+    identically.
+    """
+    task = _current_task(state)
+    if task is not None:
+        task["status"] = "done"
+        task["review_round"] = state.review_round
+        task["summary"] = _reply_from_state(state).message
+        _persist_task_list_status(state)
+    next_index = _select_next_task_index(state)
+    if next_index is not None:
+        _start_work_queue_task(state, repo, next_index)
+        _persist_task_list_status(state)
+        state.status_message = (
+            f"Task {task.get('id') if task else ''} clean; "
+            f"starting {state.tasks[next_index].get('id')}."
+        )
+        state_store.save(state)
+        run_log.add("Result", state.status_message)
+        return None
+    state.phase = "complete"
+    state.status_message = "All work-queue tasks are complete." + (
+        f" Task list: {state.problems_file}" if state.problems_file else ""
+    )
+    _persist_task_list_status(state)
+    state_store.save(state)
+    run_log.add("Result", state.status_message)
+    return 0
 
 
 def _read_context_excerpt(context_file: Optional[Path], *, max_chars: int = 60000) -> tuple[Optional[str], str]:
@@ -2300,13 +2447,59 @@ def _review_from_state(state: RunState) -> ReviewReply:
     return ReviewReply(**state.review)
 
 
+def _is_squash_of_tip(repo: Path, base: str, tip: str, head: str) -> bool:
+    """Return whether ``head`` is the single squashed commit of ``tip`` onto ``base``.
+
+    ``_summarize_and_squash_current_task`` builds one commit whose parent is the
+    task base and whose tree is the pre-squash tip's tree. A resumed HEAD is that
+    squash only if the base is its ancestor, exactly one commit separates them,
+    and its tree matches the tip's. That last check is what distinguishes the
+    squash from an unrelated descendant of the same base (an extra commit, or a
+    sibling branch), which must not be folded into the task on resume.
+    """
+    try:
+        _git(repo, "merge-base", "--is-ancestor", base, head)
+        if int(_git(repo, "rev-list", "--count", f"{base}..{head}")) != 1:
+            return False
+        tip_tree = _git(repo, "rev-parse", f"{tip}^{{tree}}")
+        head_tree = _git(repo, "rev-parse", f"{head}^{{tree}}")
+    except (OrchestrationError, ValueError):
+        return False
+    return head_tree == tip_tree
+
+
 def _validate_resume(repo: Path, state: RunState) -> None:
     if repo != Path(state.repo):
         raise OrchestrationError(
             f"saved run belongs to {state.repo}, not {repo}"
         )
-    expected = state.commit or state.base_commit
     head = _git(repo, "rev-parse", "HEAD")
+    if state.phase == "commit_summary":
+        # This phase squashes the task's commits into one summarized commit via a
+        # single ref move (reset --soft onto a commit-tree of the pre-squash tree
+        # over the task base). A crash can land between that ref move and the
+        # state save, so exactly two HEADs are consistent with the checkpoint:
+        #   * the saved pre-squash tip (== state.commit): squash not yet done; or
+        #   * the squashed commit: a one-commit descendant of the task base whose
+        #     tree equals the pre-squash tip's tree (squash done, save not).
+        # Accept only those. A broader "any descendant of the base" check would
+        # let an extra commit, or a sibling branch off the same base, be
+        # summarized and squashed into the task as if it were the task's work.
+        expected = state.commit or state.base_commit
+        if head == expected:
+            return
+        task = _current_task(state)
+        base = str((task or {}).get("task_base_commit") or "")
+        if base and state.commit and _is_squash_of_tip(
+            repo, base, state.commit, head
+        ):
+            return
+        raise OrchestrationError(
+            "repository HEAD changed since the commit-summary checkpoint: "
+            f"expected the pre-squash tip {expected[:12]} or its one-commit "
+            f"squash onto {base[:12]}, found {head}"
+        )
+    expected = state.commit or state.base_commit
     if head != expected:
         raise OrchestrationError(
             "repository HEAD changed since the saved checkpoint: "
@@ -2551,40 +2744,32 @@ def run_state_loop(
                             "known_test_results",
                             [f"Agent 2 review round {state.review_round}: clean"],
                         )
-                        if commit_policy == "squash-per-task":
-                            squashed = _squash_current_task_commit(repo, task)
-                            if squashed:
-                                state.commit = squashed
-                                state.review_head = squashed
-                                task["last_commit"] = squashed
-                        task["status"] = "done"
-                        task["review_round"] = state.review_round
-                        task["summary"] = _reply_from_state(state).message
-                        _persist_task_list_status(state)
-                    next_index = _select_next_task_index(state)
-                    if next_index is not None:
-                        _start_work_queue_task(state, repo, next_index)
-                        _persist_task_list_status(state)
-                        state.status_message = (
-                            f"Task {task.get('id') if task else ''} clean; "
-                            f"starting {state.tasks[next_index].get('id')}."
-                        )
-                        state_store.save(state)
-                        run_log.add("Result", state.status_message)
-                        continue
-                    state.phase = "complete"
-                    state.status_message = (
-                        "All work-queue tasks are complete."
-                        + (
-                            f" Task list: {state.problems_file}"
-                            if state.problems_file
-                            else ""
-                        )
+                        if commit_policy == "squash-per-task" and (
+                            _task_needs_commit_summary(repo, task)
+                        ):
+                            # A multi-commit task must be squashed into one
+                            # commit carrying the final Agent 2 summary, which
+                            # rewrites history. Route that through a dedicated
+                            # crash-safe phase: persist phase="commit_summary"
+                            # (with the clean-review memory just written) *before*
+                            # any reset/recommit. A crash mid-squash then resumes
+                            # in that idempotent phase and never re-squashes.
+                            # Single-commit tasks skip this and keep Agent 1's
+                            # original subject (see T08).
+                            state.phase = "commit_summary"
+                            state_store.save(state)
+                            continue
+                    result = _finalize_clean_work_queue_task_and_advance(
+                        state=state,
+                        repo=repo,
+                        run_log=run_log,
+                        state_store=state_store,
                     )
-                    _persist_task_list_status(state)
-                else:
-                    state.phase = "complete"
-                    state.status_message = "Agent 2 found no remaining issues."
+                    if result is not None:
+                        return result
+                    continue
+                state.phase = "complete"
+                state.status_message = "Agent 2 found no remaining issues."
                 state_store.save(state)
                 run_log.add("Result", state.status_message)
                 return 0
@@ -2615,6 +2800,30 @@ def run_state_loop(
             )
             state.phase = "agent_fix"
             state_store.save(state)
+            continue
+
+        if state.phase == "commit_summary":
+            # Resumable squash-and-summarize for a multi-commit task at clean
+            # review. The clean-review path persisted phase="commit_summary"
+            # before any history rewrite, so a crash here resumes in this same
+            # (idempotent) phase and never double-squashes.
+            _summarize_and_squash_current_task(
+                state=state,
+                repo=repo,
+                reviewer=reviewer,
+                run_log=run_log,
+            )
+            # Persist the squashed HEAD immediately so resume sees a HEAD
+            # consistent with saved state before the task is advanced.
+            state_store.save(state)
+            result = _finalize_clean_work_queue_task_and_advance(
+                state=state,
+                repo=repo,
+                run_log=run_log,
+                state_store=state_store,
+            )
+            if result is not None:
+                return result
             continue
 
         raise OrchestrationError(f"unknown saved phase: {state.phase}")

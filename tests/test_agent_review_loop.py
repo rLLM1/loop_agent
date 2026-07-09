@@ -1413,6 +1413,360 @@ def test_work_queue_commit_log_appends_one_entry_per_round(repo: Path, tmp_path:
     assert log[1]["tests"] == ["t2"]
 
 
+class _NoopStore:
+    def save(self, _value):
+        pass
+
+
+class _NoopLog:
+    def add(self, _title, _text):
+        pass
+
+
+class _TwoCommitAgent:
+    """Agent 1 that makes one commit initially and one on the review fix."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def ask(self, _prompt):
+        self.calls += 1
+        if self.calls == 1:
+            (self.repo / "tracked.txt").write_text("first\n")
+            return _reply_with_facts("Implement task", changes=["c1"])
+        (self.repo / "tracked.txt").write_text("fixed\n")
+        return _reply_with_facts("Fix finding", tests=["t2"])
+
+
+def test_work_queue_multi_commit_converges_to_summarized_commit(
+    repo: Path, tmp_path: Path
+):
+    """A converged multi-commit task ends as one commit with the Agent 2 summary."""
+    queue = tmp_path / "queue.md"
+    queue.write_text("- [ ] T01: fix one thing\n  Scope: tracked.txt only.\n")
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="summary-converge",
+        work_queue=True,
+    )
+    base = state.tasks[0]["task_base_commit"]
+
+    agent = _TwoCommitAgent()
+    agent.repo = repo
+    captured = {}
+
+    class FakeReviewer:
+        def __init__(self):
+            self.review_calls = 0
+            self.summary_calls = 0
+
+        def review(self, **_kwargs):
+            self.review_calls += 1
+            if self.review_calls == 1:
+                return agent_loop.ReviewReply(
+                    "issues",
+                    "One issue.",
+                    [{"severity": "medium", "title": "x", "details": "fix it"}],
+                )
+            return agent_loop.ReviewReply("clean", "No issues.", [])
+
+        def summarize_commit(
+            self, *, base_commit, head_commit, task_commit_log, recorded_tests
+        ):
+            self.summary_calls += 1
+            captured["base"] = base_commit
+            captured["head"] = head_commit
+            captured["log"] = list(task_commit_log)
+            captured["tests"] = list(recorded_tests)
+            return agent_loop.CommitSummary(
+                "Summarize the whole task",
+                "Root cause: c1\n\nValidation: t2",
+            )
+
+    reviewer = FakeReviewer()
+    result = agent_loop.run_state_loop(
+        state=state,
+        state_store=_NoopStore(),
+        run_log=_NoopLog(),
+        agent1=agent,
+        reviewer=reviewer,
+        max_rounds=3,
+        max_dispute_rounds=3,
+    )
+
+    assert result == 0
+    head = _git(repo, "rev-parse", "HEAD")
+    # Exactly one commit remains on top of the task base, carrying the summary.
+    assert _git(repo, "rev-list", "--count", f"{base}..HEAD") == "1"
+    assert _git(repo, "log", "-1", "--format=%s", "HEAD") == "Summarize the whole task"
+    body = _git(repo, "log", "-1", "--format=%b", "HEAD")
+    assert "Root cause: c1" in body
+    assert "Validation: t2" in body
+    # The summary pass ran once against the pre-squash multi-commit tip and saw
+    # the full append-only log, with the synthetic clean marker filtered out.
+    assert reviewer.summary_calls == 1
+    assert captured["base"] == base
+    assert _git(repo, "rev-list", "--count", f"{base}..{captured['head']}") == "2"
+    assert [entry["round"] for entry in captured["log"]] == [1, 2]
+    assert "t2" in captured["tests"]
+    assert not any("Agent 2 review round" in item for item in captured["tests"])
+    # State and task now point at the squashed commit, consistent with HEAD.
+    assert state.commit == head
+    assert state.review_head == head
+    assert state.tasks[0]["status"] == "done"
+    assert state.tasks[0]["last_commit"] == head
+
+
+def test_work_queue_multi_commit_summary_failure_uses_fallback(
+    repo: Path, tmp_path: Path
+):
+    """A failed Agent 2 summary still squashes, using the deterministic fallback."""
+    queue = tmp_path / "queue.md"
+    queue.write_text("- [ ] T01: fix one thing\n  Scope: tracked.txt only.\n")
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="summary-fallback",
+        work_queue=True,
+    )
+    base = state.tasks[0]["task_base_commit"]
+
+    agent = _TwoCommitAgent()
+    agent.repo = repo
+
+    class FakeReviewer:
+        def __init__(self):
+            self.review_calls = 0
+
+        def review(self, **_kwargs):
+            self.review_calls += 1
+            if self.review_calls == 1:
+                return agent_loop.ReviewReply(
+                    "issues",
+                    "One issue.",
+                    [{"severity": "medium", "title": "x", "details": "fix it"}],
+                )
+            return agent_loop.ReviewReply("clean", "No issues.", [])
+
+        def summarize_commit(self, **_kwargs):
+            raise agent_loop.OrchestrationError("codex summary crashed")
+
+    result = agent_loop.run_state_loop(
+        state=state,
+        state_store=_NoopStore(),
+        run_log=_NoopLog(),
+        agent1=agent,
+        reviewer=FakeReviewer(),
+        max_rounds=3,
+        max_dispute_rounds=3,
+    )
+
+    assert result == 0
+    # Still squashed to one commit, but the message is the fallback built from
+    # Agent 1 facts: subject = last non-empty round subject, body = labeled facts.
+    assert _git(repo, "rev-list", "--count", f"{base}..HEAD") == "1"
+    assert _git(repo, "log", "-1", "--format=%s", "HEAD") == "Fix finding"
+    body = _git(repo, "log", "-1", "--format=%b", "HEAD")
+    assert "Implementation notes:" in body
+    assert "- Round 1: c1" in body
+    assert "Validation:" in body
+    assert "- Round 2: t2" in body
+
+
+def test_commit_summary_resume_never_re_squashes(repo: Path, tmp_path: Path):
+    """A crash between the squash ref-move and the state save must be idempotent.
+
+    Simulates resuming at phase="commit_summary" when the squash already landed
+    (HEAD is the single squashed commit) but the post-squash save never happened
+    (state.review_head still points at the stale multi-commit tip). Resume must
+    not re-run the summary pass or re-squash; it just repairs state to HEAD.
+    """
+    queue = tmp_path / "queue.md"
+    queue.write_text("- [ ] T01: fix one thing\n  Scope: tracked.txt only.\n")
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="summary-resume",
+        work_queue=True,
+    )
+    base = state.tasks[0]["task_base_commit"]
+
+    # Build a real multi-commit range on top of the task base.
+    (repo / "tracked.txt").write_text("first\n")
+    subprocess.run(["git", "commit", "-am", "c1", "-q"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("second\n")
+    subprocess.run(["git", "commit", "-am", "c2", "-q"], cwd=repo, check=True)
+    old_tip = _git(repo, "rev-parse", "HEAD")
+
+    # Simulate the squash having already landed (crash was AFTER the ref move).
+    tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    squashed = _git(
+        repo,
+        "commit-tree",
+        tree,
+        "-p",
+        base,
+        "-m",
+        "Already squashed subject",
+        "-m",
+        "Already squashed body",
+    )
+    _git(repo, "reset", "--soft", squashed)
+    head_before = _git(repo, "rev-parse", "HEAD")
+
+    # Reconstruct the resumed state: phase="commit_summary", but review_head is
+    # the stale pre-squash tip that the interrupted run never got to update.
+    state.phase = "commit_summary"
+    state.current_task_index = 0
+    task = state.tasks[0]
+    task["status"] = "running"
+    task["task_commit_log"] = [
+        {"round": 1, "commit_message": "c1", "root_cause": [], "changes": ["c1"], "tests": [], "deferred": []},
+        {"round": 2, "commit_message": "c2", "root_cause": [], "changes": [], "tests": ["t2"], "deferred": []},
+    ]
+    state.review_head = old_tip
+    state.commit = old_tip
+    state.reply = agent_loop.asdict(_reply_with_facts("c2", tests=["t2"]))
+
+    class GuardReviewer:
+        def review(self, **_kwargs):
+            raise AssertionError("review must not run when resuming at commit_summary")
+
+        def summarize_commit(self, **_kwargs):
+            raise AssertionError("summary must not re-run once the squash landed")
+
+    result = agent_loop.run_state_loop(
+        state=state,
+        state_store=_NoopStore(),
+        run_log=_NoopLog(),
+        agent1=object(),
+        reviewer=GuardReviewer(),
+        max_rounds=3,
+        max_dispute_rounds=3,
+    )
+
+    assert result == 0
+    head = _git(repo, "rev-parse", "HEAD")
+    # HEAD is unchanged (no second squash) and stays a single commit off base.
+    assert head == head_before
+    assert _git(repo, "rev-list", "--count", f"{base}..HEAD") == "1"
+    assert _git(repo, "log", "-1", "--format=%s", "HEAD") == "Already squashed subject"
+    # Stale state is repaired to the consistent HEAD and the task finishes.
+    assert state.commit == head
+    assert state.review_head == head
+    assert state.tasks[0]["last_commit"] == head
+    assert state.tasks[0]["status"] == "done"
+    assert state.phase == "complete"
+
+
+def test_validate_resume_tolerates_squashed_head_in_commit_summary(
+    repo: Path, tmp_path: Path
+):
+    """Resume validation must accept a mid-squash HEAD advance.
+
+    A crash between the squash ref move and the state save leaves HEAD on the
+    squashed commit while state.commit still points at the pre-squash tip.
+    _validate_resume must accept that (the phase reconciles it) but still reject
+    a HEAD that is not built on the task base.
+    """
+    queue = tmp_path / "queue.md"
+    queue.write_text("- [ ] T01: fix one thing\n  Scope: tracked.txt only.\n")
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="validate-resume",
+        work_queue=True,
+    )
+    base = state.tasks[0]["task_base_commit"]
+    (repo / "tracked.txt").write_text("first\n")
+    subprocess.run(["git", "commit", "-am", "c1", "-q"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("second\n")
+    subprocess.run(["git", "commit", "-am", "c2", "-q"], cwd=repo, check=True)
+    old_tip = _git(repo, "rev-parse", "HEAD")
+
+    state.phase = "commit_summary"
+    state.current_task_index = 0
+    state.commit = old_tip
+
+    # (1) Pre-squash: HEAD == state.commit -> accepted.
+    agent_loop._validate_resume(repo, state)
+
+    # (2) Post-squash crash: HEAD advanced to the squashed commit off base while
+    #     state.commit still points at the stale tip -> accepted.
+    tree = _git(repo, "rev-parse", "HEAD^{tree}")
+    squashed = _git(repo, "commit-tree", tree, "-p", base, "-m", "squashed")
+    _git(repo, "reset", "--soft", squashed)
+    assert _git(repo, "rev-parse", "HEAD") != state.commit
+    agent_loop._validate_resume(repo, state)
+
+    # (3) A HEAD that is not built on the recorded task base is still rejected.
+    state.tasks[0]["task_base_commit"] = old_tip
+    state.commit = old_tip
+    with pytest.raises(agent_loop.OrchestrationError):
+        agent_loop._validate_resume(repo, state)
+
+
+def test_validate_resume_rejects_unrelated_descendant_in_commit_summary(
+    repo: Path, tmp_path: Path
+):
+    """Resume must reject a *different* one-commit descendant of the task base.
+
+    The commit-summary window only tolerates the saved pre-squash tip or the one
+    squashed commit whose tree matches it. A sibling commit off the same base
+    (HEAD advanced to an extra commit, or another branch built on the base) has a
+    different tree, so accepting it would fold unrelated work into the task and
+    mark it done. Regression for the over-broad is-ancestor acceptance.
+    """
+    queue = tmp_path / "queue.md"
+    queue.write_text("- [ ] T01: fix one thing\n  Scope: tracked.txt only.\n")
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="validate-resume-unrelated",
+        work_queue=True,
+    )
+    base = state.tasks[0]["task_base_commit"]
+    (repo / "tracked.txt").write_text("first\n")
+    subprocess.run(["git", "commit", "-am", "c1", "-q"], cwd=repo, check=True)
+    (repo / "tracked.txt").write_text("second\n")
+    subprocess.run(["git", "commit", "-am", "c2", "-q"], cwd=repo, check=True)
+    tip = _git(repo, "rev-parse", "HEAD")
+
+    state.phase = "commit_summary"
+    state.current_task_index = 0
+    state.commit = tip
+
+    # A one-commit descendant of the same base carrying a *different* tree.
+    (repo / "tracked.txt").write_text("unrelated\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    other_tree = _git(repo, "write-tree")
+    sibling = _git(repo, "commit-tree", other_tree, "-p", base, "-m", "unrelated")
+    _git(repo, "reset", "--hard", sibling)
+    assert _git(repo, "rev-parse", "HEAD") == sibling
+    # One commit off base and base is its ancestor, but the tree differs from the
+    # pre-squash tip, so it is not the task's squash -> rejected.
+    with pytest.raises(agent_loop.OrchestrationError):
+        agent_loop._validate_resume(repo, state)
+
+    # An *extra* commit stacked on the legitimate squash (count > 1) is rejected.
+    squash_tree = _git(repo, "rev-parse", f"{tip}^{{tree}}")
+    squashed = _git(repo, "commit-tree", squash_tree, "-p", base, "-m", "squashed")
+    extra = _git(repo, "commit-tree", squash_tree, "-p", squashed, "-m", "extra")
+    _git(repo, "reset", "--hard", extra)
+    with pytest.raises(agent_loop.OrchestrationError):
+        agent_loop._validate_resume(repo, state)
+
+    # The legitimate single squash of the recorded tip is still accepted.
+    _git(repo, "reset", "--hard", squashed)
+    agent_loop._validate_resume(repo, state)
+
+
 def test_commit_log_append_is_gated_behind_review_range_validation(
     repo: Path, monkeypatch
 ):
@@ -1868,6 +2222,62 @@ def test_summarize_commit_prompt_includes_all_rounds(repo: Path, tmp_path: Path)
     assert "Do not invent tests" in prompt
 
 
+def test_commit_summary_or_fallback_blank_subject_uses_fallback(
+    repo: Path, tmp_path: Path
+):
+    """A schema-valid but whitespace-only Codex subject degrades to the fallback."""
+    (repo / "tracked.txt").write_text("changed\n")
+    subprocess.run(["git", "commit", "-aqm", "second"], cwd=repo, check=True)
+    base = _git(repo, "rev-parse", "HEAD~1")
+    head = _git(repo, "rev-parse", "HEAD")
+
+    fake_codex = tmp_path / "fake_codex.py"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+        "payload = {"
+        "'status': 'commit_summary',"
+        "'final_commit_subject': '   ',"
+        "'final_commit_body': 'Body text'}\n"
+        "open(out, 'w').write(json.dumps(payload))\n"
+    )
+    fake_codex.chmod(0o755)
+
+    reviewer = agent_loop.CodexReviewer(
+        executable=str(fake_codex),
+        repo=repo,
+        model=None,
+    )
+    task = {
+        "task_commit_log": [
+            {
+                "round": 1,
+                "commit_message": "Implement feature",
+                "root_cause": ["rc1"],
+                "changes": ["c1"],
+                "tests": ["t1"],
+                "deferred": [],
+            },
+        ],
+    }
+
+    summary = agent_loop._commit_summary_or_fallback(
+        reviewer=reviewer,
+        repo=repo,
+        task=task,
+        base=base,
+        head=head,
+        run_log=_NoopLog(),
+    )
+
+    # The blank reviewer subject is rejected, so the fallback (last non-empty
+    # round subject + labeled facts) is used instead of committing whitespace.
+    assert summary.final_commit_subject == "Implement feature"
+    assert "Implementation notes:" in summary.final_commit_body
+    assert "- Round 1: c1" in summary.final_commit_body
+
+
 def test_commit_summary_from_value_parses_and_validates():
     summary = agent_loop._commit_summary_from_value(
         {
@@ -1878,6 +2288,37 @@ def test_commit_summary_from_value_parses_and_validates():
     )
     assert summary.final_commit_subject == "Do the thing"
     assert summary.final_commit_body == "Details."
+
+    # Surrounding whitespace is stripped from the subject.
+    stripped = agent_loop._commit_summary_from_value(
+        {
+            "status": "commit_summary",
+            "final_commit_subject": "  Do the thing  ",
+            "final_commit_body": "Details.",
+        }
+    )
+    assert stripped.final_commit_subject == "Do the thing"
+
+    # A whitespace-only subject is treated as a summary failure so the caller
+    # degrades to the deterministic fallback instead of committing a blank
+    # subject.
+    with pytest.raises(agent_loop.OrchestrationError):
+        agent_loop._commit_summary_from_value(
+            {
+                "status": "commit_summary",
+                "final_commit_subject": "   ",
+                "final_commit_body": "Details.",
+            }
+        )
+    # An empty subject is likewise rejected.
+    with pytest.raises(agent_loop.OrchestrationError):
+        agent_loop._commit_summary_from_value(
+            {
+                "status": "commit_summary",
+                "final_commit_subject": "",
+                "final_commit_body": "Details.",
+            }
+        )
 
     # A missing required field raises OrchestrationError.
     with pytest.raises(agent_loop.OrchestrationError):
