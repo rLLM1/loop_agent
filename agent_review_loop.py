@@ -77,6 +77,21 @@ REVIEW_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Schema for the final Agent 2 commit-summary pass (T05). This is a separate
+# read-only pass, distinct from the code-only REVIEW_SCHEMA: it never carries
+# issues, only a summarized subject/body derived from Agent 1's recorded facts
+# and the final diff.
+COMMIT_SUMMARY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["commit_summary"]},
+        "final_commit_subject": {"type": "string"},
+        "final_commit_body": {"type": "string"},
+    },
+    "required": ["status", "final_commit_subject", "final_commit_body"],
+    "additionalProperties": False,
+}
+
 AGENT1_SYSTEM = """\
 You are agent 1, the implementing coding agent. Work directly in the current
 repository. Investigate, edit, and test as needed. Do not commit or push; the
@@ -154,6 +169,12 @@ class ReviewReply:
     status: str
     summary: str
     issues: List[Dict[str, str]]
+
+
+@dataclass
+class CommitSummary:
+    final_commit_subject: str
+    final_commit_body: str
 
 
 @dataclass
@@ -781,6 +802,84 @@ def _append_task_commit_log(task: Dict[str, Any], reply: Agent1Reply) -> Dict[st
         entry[field_name] = list(commit_update[field_name])
     log.append(entry)
     return entry
+
+
+# Bookkeeping marker written to known_test_results when a review comes back
+# clean (see the review phase). It is not a real recorded test result, so it is
+# filtered out before facts are fed into the final commit-summary pass.
+_CLEAN_REVIEW_MARKER_RE = re.compile(r"^Agent 2 review round \d+: clean$")
+
+
+def _is_clean_review_marker(text: str) -> bool:
+    return bool(_CLEAN_REVIEW_MARKER_RE.match(text.strip()))
+
+
+def _recorded_tests_for_summary(task: Dict[str, Any]) -> List[str]:
+    """Collect real recorded test results for the final commit-summary pass.
+
+    The source is every ``tests`` fact from the append-only task_commit_log (all
+    rounds) followed by task["task_memory"]["known_test_results"]. The synthetic
+    "Agent 2 review round N: clean" marker is excluded because it is orchestrator
+    bookkeeping, not a test result. Order is preserved and duplicates are kept
+    verbatim; the summary pass itself removes duplicate/obsolete details.
+    """
+    tests: List[str] = []
+    log = task.get("task_commit_log")
+    if isinstance(log, list):
+        for entry in log:
+            if not isinstance(entry, dict):
+                continue
+            for item in entry.get("tests") or []:
+                text = str(item).strip()
+                if text and not _is_clean_review_marker(text):
+                    tests.append(text)
+    memory = _normalize_task_memory(task.get("task_memory"))
+    for item in memory["known_test_results"]:
+        text = str(item).strip()
+        if text and not _is_clean_review_marker(text):
+            tests.append(text)
+    return tests
+
+
+def _format_commit_log_for_summary(task_commit_log: Sequence[Dict[str, Any]]) -> str:
+    """Render every append-only commit-log round as plain text for the prompt.
+
+    All rounds are included verbatim so the summary pass sees the full history
+    of recorded facts and can collapse duplicates itself.
+    """
+    if not task_commit_log:
+        return "(no recorded commit facts)"
+    labels = (
+        ("root_cause", "Root cause"),
+        ("changes", "Changes"),
+        ("tests", "Tests"),
+        ("deferred", "Deferred"),
+    )
+    blocks: List[str] = []
+    for entry in task_commit_log:
+        if not isinstance(entry, dict):
+            continue
+        round_no = entry.get("round", len(blocks) + 1)
+        lines = [f"Round {round_no}:"]
+        subject = str(entry.get("commit_message") or "").strip()
+        lines.append(f"  commit_message: {subject or '(none)'}")
+        for key, label in labels:
+            for item in entry.get(key) or []:
+                lines.append(f"  {label}: {item}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _commit_summary_from_value(value: Dict[str, Any]) -> CommitSummary:
+    _require_fields(
+        value,
+        status_values={"commit_summary"},
+        text_fields={"final_commit_subject", "final_commit_body"},
+    )
+    return CommitSummary(
+        final_commit_subject=value["final_commit_subject"],
+        final_commit_body=value["final_commit_body"],
+    )
 
 
 def _review_issue_memory(review: ReviewReply) -> List[str]:
@@ -1492,6 +1591,102 @@ commit facts.
             summary=value["summary"],
             issues=issues,
         )
+
+    def summarize_commit(
+        self,
+        *,
+        base_commit: str,
+        head_commit: str,
+        task_commit_log: Sequence[Dict[str, Any]],
+        recorded_tests: Sequence[str],
+    ) -> CommitSummary:
+        """Final read-only pass: summarize Agent 1's facts into a commit message.
+
+        Unlike ``review`` this pass emits no findings. It sees only the diff
+        stat for ``base_commit..head_commit``, every round of the append-only
+        ``task_commit_log``, and the ``recorded_tests`` supplied by the caller,
+        and returns a summarized ``final_commit_subject``/``final_commit_body``.
+        """
+        self.call_count += 1
+        diff_stat = _git(
+            self.repo, "diff", "--stat", f"{base_commit}..{head_commit}"
+        )
+        commit_log_text = _format_commit_log_for_summary(list(task_commit_log))
+        if recorded_tests:
+            tests_text = "\n".join(f"- {item}" for item in recorded_tests)
+        else:
+            tests_text = "(none recorded)"
+        prompt = f"""\
+Write the final squashed-commit message for the task whose cumulative changes
+are {base_commit}..{head_commit}. This is a read-only summarizing pass: do not
+edit files, commit, or run destructive commands.
+
+Diff stat for {base_commit}..{head_commit}:
+{diff_stat or "(no changes)"}
+
+Append-only commit facts recorded by the implementing agent across all rounds:
+{commit_log_text}
+
+Recorded test results:
+{tests_text}
+
+Summarize only the facts supplied above and the diff stat. Remove duplicate and
+obsolete details so the message reflects the final end state, not the history of
+fixes. Do not invent tests, files, or changes that are absent from the supplied
+facts and the diff. Return status="commit_summary" with:
+- final_commit_subject: one imperative subject line of at most 72 characters.
+- final_commit_body: a concise body covering the durable root cause, changes,
+  tests, and any deferred follow-ups; omit any section that has no facts.
+"""
+        with tempfile.TemporaryDirectory(prefix="agent-commit-summary-") as tmp:
+            tmp_path = Path(tmp)
+            schema_path = tmp_path / "commit_summary_schema.json"
+            output_path = tmp_path / "commit_summary.json"
+            schema_path.write_text(
+                json.dumps(COMMIT_SUMMARY_SCHEMA), encoding="utf-8"
+            )
+            command = [
+                self.executable,
+                "exec",
+                "--sandbox",
+                "read-only",
+                "--cd",
+                str(self.repo),
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+            ]
+            if self.model:
+                command.extend(["--model", self.model])
+            command.append(prompt)
+            raw_log_path = None
+            if self.raw_log_dir is not None:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                raw_log_path = (
+                    self.raw_log_dir
+                    / (
+                        f"{stamp}_{self.raw_log_label}"
+                        f"_agent2_commit_summary_{self.call_count:03d}.log"
+                    )
+                )
+            result = _run(
+                command,
+                cwd=self.repo,
+                raw_log_path=raw_log_path,
+                heartbeat_seconds=self.heartbeat_seconds,
+                timeout_seconds=self.timeout_seconds,
+                heartbeat_label=f"agent 2 commit summary {self.call_count}",
+            )
+            if result.returncode != 0:
+                raise OrchestrationError(
+                    f"Codex commit summary failed (exit {result.returncode}): "
+                    f"{result.stderr.strip()}"
+                )
+            raw = output_path.read_text() if output_path.exists() else result.stdout
+
+        value = _extract_json_object(raw)
+        return _commit_summary_from_value(value)
 
 
 class CodexPlanReviewer:

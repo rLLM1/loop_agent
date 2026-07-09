@@ -1781,3 +1781,174 @@ def test_interrupted_question_can_resume(repo: Path, tmp_path: Path):
     assert store.load(state.run_id).phase == "complete"
     assert (repo / "tracked.txt").read_text() == "42\n"
     assert _git(repo, "log", "-1", "--pretty=%s") == "Set requested value"
+
+
+def test_summarize_commit_prompt_includes_all_rounds(repo: Path, tmp_path: Path):
+    # Two commits so base..head is a real range for git diff --stat.
+    (repo / "tracked.txt").write_text("changed\n")
+    subprocess.run(["git", "commit", "-aqm", "second"], cwd=repo, check=True)
+    base = _git(repo, "rev-parse", "HEAD~1")
+    head = _git(repo, "rev-parse", "HEAD")
+
+    fake_codex = tmp_path / "fake_codex.py"
+    captured_prompt = tmp_path / "prompt.txt"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"open({str(captured_prompt)!r}, 'w').write(sys.argv[-1])\n"
+        "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+        "payload = {"
+        "'status': 'commit_summary',"
+        "'final_commit_subject': 'Summarize task',"
+        "'final_commit_body': 'Body text'}\n"
+        "open(out, 'w').write(json.dumps(payload))\n"
+    )
+    fake_codex.chmod(0o755)
+
+    reviewer = agent_loop.CodexReviewer(
+        executable=str(fake_codex),
+        repo=repo,
+        model=None,
+    )
+    task_commit_log = [
+        {
+            "round": 1,
+            "commit_message": "Implement feature",
+            "root_cause": ["rc1"],
+            "changes": ["c1"],
+            "tests": ["t1"],
+            "deferred": [],
+        },
+        {
+            "round": 2,
+            "commit_message": "Fix first finding",
+            "root_cause": [],
+            "changes": ["c2"],
+            "tests": ["t2"],
+            "deferred": ["d2"],
+        },
+        {
+            "round": 3,
+            "commit_message": "Fix second finding",
+            "root_cause": [],
+            "changes": ["c3"],
+            "tests": [],
+            "deferred": [],
+        },
+    ]
+
+    summary = reviewer.summarize_commit(
+        base_commit=base,
+        head_commit=head,
+        task_commit_log=task_commit_log,
+        recorded_tests=["t1", "t2"],
+    )
+
+    assert isinstance(summary, agent_loop.CommitSummary)
+    assert summary.final_commit_subject == "Summarize task"
+    assert summary.final_commit_body == "Body text"
+
+    prompt = captured_prompt.read_text()
+    # Every recorded round appears in the prompt.
+    assert "Round 1:" in prompt
+    assert "Round 2:" in prompt
+    assert "Round 3:" in prompt
+    assert "Implement feature" in prompt
+    assert "Fix first finding" in prompt
+    assert "Fix second finding" in prompt
+    # The diff stat range and changed file are supplied.
+    assert f"Diff stat for {base}..{head}:" in prompt
+    assert "tracked.txt" in prompt
+    # Recorded tests are fed in.
+    assert "- t1" in prompt
+    assert "- t2" in prompt
+    # Read-only summarizing instructions are present.
+    assert "read-only summarizing pass" in prompt
+    assert "Remove duplicate and" in prompt
+    assert "Do not invent tests" in prompt
+
+
+def test_commit_summary_from_value_parses_and_validates():
+    summary = agent_loop._commit_summary_from_value(
+        {
+            "status": "commit_summary",
+            "final_commit_subject": "Do the thing",
+            "final_commit_body": "Details.",
+        }
+    )
+    assert summary.final_commit_subject == "Do the thing"
+    assert summary.final_commit_body == "Details."
+
+    # A missing required field raises OrchestrationError.
+    with pytest.raises(agent_loop.OrchestrationError):
+        agent_loop._commit_summary_from_value(
+            {
+                "status": "commit_summary",
+                "final_commit_subject": "Do the thing",
+            }
+        )
+    # A non-string body raises OrchestrationError.
+    with pytest.raises(agent_loop.OrchestrationError):
+        agent_loop._commit_summary_from_value(
+            {
+                "status": "commit_summary",
+                "final_commit_subject": "Do the thing",
+                "final_commit_body": ["not", "a", "string"],
+            }
+        )
+    # The wrong status raises OrchestrationError.
+    with pytest.raises(agent_loop.OrchestrationError):
+        agent_loop._commit_summary_from_value(
+            {
+                "status": "clean",
+                "final_commit_subject": "s",
+                "final_commit_body": "b",
+            }
+        )
+
+
+def test_recorded_tests_for_summary_excludes_clean_marker():
+    task = {
+        "task_commit_log": [
+            {
+                "round": 1,
+                "commit_message": "m",
+                "root_cause": [],
+                "changes": [],
+                "tests": ["pytest tests/test_x.py -k a"],
+                "deferred": [],
+            },
+            {
+                "round": 2,
+                "commit_message": "m",
+                "root_cause": [],
+                "changes": [],
+                "tests": ["pytest tests/test_x.py -k b"],
+                "deferred": [],
+            },
+        ],
+        "task_memory": {
+            "known_test_results": [
+                "manual smoke test passed",
+                "Agent 2 review round 1: clean",
+                "Agent 2 review round 2: clean",
+            ],
+        },
+    }
+
+    tests = agent_loop._recorded_tests_for_summary(task)
+
+    # Real recorded tests from the log and known_test_results are kept.
+    assert "pytest tests/test_x.py -k a" in tests
+    assert "pytest tests/test_x.py -k b" in tests
+    assert "manual smoke test passed" in tests
+    # The synthetic clean-review marker is never fed into the summary pass.
+    assert all(not agent_loop._is_clean_review_marker(t) for t in tests)
+    assert not any(t.startswith("Agent 2 review round") for t in tests)
+
+
+def test_is_clean_review_marker_matches_only_synthetic_marker():
+    assert agent_loop._is_clean_review_marker("Agent 2 review round 1: clean")
+    assert agent_loop._is_clean_review_marker("Agent 2 review round 12: clean")
+    assert not agent_loop._is_clean_review_marker("Agent 2 review round 1: issues")
+    assert not agent_loop._is_clean_review_marker("pytest passed")
