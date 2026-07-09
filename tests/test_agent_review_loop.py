@@ -1438,6 +1438,18 @@ class _TwoCommitAgent:
         return _reply_with_facts("Fix finding", tests=["t2"])
 
 
+class _OneCommitAgent:
+    """Agent 1 that makes exactly one commit and needs no review fixes."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def ask(self, _prompt):
+        self.calls += 1
+        (self.repo / "tracked.txt").write_text("only\n")
+        return _reply_with_facts("Implement task once", changes=["c1"])
+
+
 def test_work_queue_multi_commit_converges_to_summarized_commit(
     repo: Path, tmp_path: Path
 ):
@@ -1574,6 +1586,71 @@ def test_work_queue_multi_commit_summary_failure_uses_fallback(
     assert "- Round 1: c1" in body
     assert "Validation:" in body
     assert "- Round 2: t2" in body
+
+
+def test_work_queue_single_commit_is_not_summarized_or_amended(
+    repo: Path, tmp_path: Path
+):
+    """A single-commit task keeps Agent 1's message; the summary path never runs.
+
+    This is the T08 decision: only multi-commit squash-per-task ranges are routed
+    through the final Agent 2 commit-summary pass. A task that produced exactly
+    one commit must be left byte-for-byte as Agent 1 committed it -- no amend, no
+    re-created commit, and no ``summarize_commit`` call.
+    """
+    queue = tmp_path / "queue.md"
+    queue.write_text("- [ ] T01: fix one thing\n  Scope: tracked.txt only.\n")
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="single-commit-no-summary",
+        work_queue=True,
+    )
+    base = state.tasks[0]["task_base_commit"]
+
+    agent = _OneCommitAgent()
+    agent.repo = repo
+
+    class FakeReviewer:
+        def __init__(self):
+            self.review_calls = 0
+            self.summary_calls = 0
+
+        def review(self, **_kwargs):
+            # Clean on the first (and only) review: the task ends as one commit.
+            self.review_calls += 1
+            return agent_loop.ReviewReply("clean", "No issues.", [])
+
+        def summarize_commit(self, **_kwargs):
+            self.summary_calls += 1
+            raise AssertionError(
+                "summarize_commit must not run for a single-commit task"
+            )
+
+    reviewer = FakeReviewer()
+    result = agent_loop.run_state_loop(
+        state=state,
+        state_store=_NoopStore(),
+        run_log=_NoopLog(),
+        agent1=agent,
+        reviewer=reviewer,
+        max_rounds=3,
+        max_dispute_rounds=3,
+    )
+
+    assert result == 0
+    # The final Agent 2 summary pass never ran for a single-commit task.
+    assert reviewer.summary_calls == 0
+    # Exactly one commit on top of base, still carrying Agent 1's original
+    # subject -- not the (absent) summary and not a rewritten commit.
+    assert _git(repo, "rev-list", "--count", f"{base}..HEAD") == "1"
+    assert _git(repo, "log", "-1", "--format=%s", "HEAD") == "Implement task once"
+    head = _git(repo, "rev-parse", "HEAD")
+    # State/task point at the untouched single commit; the task still completes.
+    assert state.commit == head
+    assert state.tasks[0]["status"] == "done"
+    assert state.tasks[0]["last_commit"] == head
 
 
 def test_commit_summary_resume_never_re_squashes(repo: Path, tmp_path: Path):

@@ -260,6 +260,14 @@ Default behavior should be:
 fix commits may exist during the task, but the final task state should be
 squashed or amended before moving to the next task.
 
+When a task produced more than one commit, the squash message is written by a
+final Agent B commit-summary pass over the whole `task_base_commit..HEAD` range
+(falling back to a deterministic summary of Agent A's recorded facts if that
+pass fails). As a deliberate limitation, a task that produced only a single
+commit is left exactly as-is: its history is not rewritten and it keeps Agent
+A's original commit subject/body rather than being amended with an Agent B
+summary. This avoids extra history rewriting when there is nothing to squash.
+
 Example command:
 
 ```bash

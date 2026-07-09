@@ -1941,7 +1941,13 @@ def _task_needs_commit_summary(repo: Path, task: Dict[str, Any]) -> bool:
 
     Only a genuine multi-commit range is routed through the crash-safe
     commit-summary phase. Single-commit (or no-commit) tasks keep Agent 1's
-    original subject/body and never run the final Agent 2 summary pass (T08).
+    original subject/body and never run the final Agent 2 summary pass.
+
+    This is a deliberate limitation (T08): the final Agent 2 commit summary
+    applies only when squash-per-task actually has multiple commits to squash.
+    A single-commit task is left exactly as Agent 1 committed it -- its history
+    is never rewritten or amended -- to avoid needless history rewriting when
+    there is nothing to squash.
     """
     base = str(task.get("task_base_commit") or "")
     if not base:
