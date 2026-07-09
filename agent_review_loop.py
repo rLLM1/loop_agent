@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set
@@ -93,6 +93,28 @@ class OrchestrationError(RuntimeError):
     """Raised for an invalid response or unsafe repository state."""
 
 
+COMMIT_UPDATE_FIELDS = ("root_cause", "changes", "tests", "deferred")
+
+
+def _normalize_commit_update(value: Any) -> Dict[str, List[str]]:
+    """Coerce arbitrary input into the four commit-update list fields.
+
+    Always returns a fresh dict with exactly ``root_cause``, ``changes``,
+    ``tests`` and ``deferred`` keys mapped to lists of strings. Unknown keys are
+    dropped; missing or non-list values become empty lists; each list element is
+    coerced to ``str``. Never raises.
+    """
+    source = value if isinstance(value, dict) else {}
+    normalized: Dict[str, List[str]] = {}
+    for key in COMMIT_UPDATE_FIELDS:
+        raw = source.get(key)
+        if isinstance(raw, list):
+            normalized[key] = [str(item) for item in raw]
+        else:
+            normalized[key] = []
+    return normalized
+
+
 @dataclass
 class Agent1Reply:
     status: str
@@ -102,6 +124,9 @@ class Agent1Reply:
     work_branch: str = ""
     review_base: str = ""
     review_head: str = ""
+    commit_update: Dict[str, List[str]] = field(
+        default_factory=lambda: _normalize_commit_update(None)
+    )
 
 
 @dataclass
@@ -176,7 +201,7 @@ class RunState:
     phase: str = "agent_initial"
     agent_mode: str = "initial"
     pending_prompt: str = ""
-    reply: Optional[Dict[str, str]] = None
+    reply: Optional[Dict[str, Any]] = None
     review: Optional[Dict[str, Any]] = None
     commit: Optional[str] = None
     review_base: Optional[str] = None
@@ -1162,6 +1187,7 @@ def _agent1_reply_from_value(value: Dict[str, Any]) -> Agent1Reply:
         work_branch=value.get("work_branch") or "",
         review_base=value.get("review_base") or "",
         review_head=value.get("review_head") or "",
+        commit_update=_normalize_commit_update(value.get("commit_update")),
     )
 
 

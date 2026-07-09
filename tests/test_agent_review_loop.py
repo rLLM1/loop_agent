@@ -1111,6 +1111,98 @@ def test_parser_accepts_new_branch_and_legacy_branch_alias():
     assert legacy.new_branch == "feature/legacy"
 
 
+def test_agent1_reply_parses_and_round_trips_commit_update():
+    reply = agent_loop._agent1_reply_from_value(
+        {
+            "status": "conclusion",
+            "message": "done",
+            "commit_message": "Fix bug",
+            "commit_update": {
+                "root_cause": ["null deref on empty input"],
+                "changes": ["guard input", "add check"],
+                "tests": ["unit: guard input"],
+                "deferred": ["refactor later"],
+                "unknown": ["should be dropped"],
+            },
+        }
+    )
+    expected = {
+        "root_cause": ["null deref on empty input"],
+        "changes": ["guard input", "add check"],
+        "tests": ["unit: guard input"],
+        "deferred": ["refactor later"],
+    }
+    assert reply.commit_update == expected
+    # asdict round-trips the nested commit facts and rebuilds cleanly.
+    dumped = agent_loop.asdict(reply)
+    assert dumped["commit_update"] == expected
+    assert agent_loop.Agent1Reply(**dumped).commit_update == expected
+
+
+def test_agent1_reply_defaults_commit_update_when_absent():
+    reply = agent_loop._agent1_reply_from_value(
+        {
+            "status": "conclusion",
+            "message": "done",
+            "commit_message": "Fix bug",
+        }
+    )
+    assert reply.commit_update == {
+        "root_cause": [],
+        "changes": [],
+        "tests": [],
+        "deferred": [],
+    }
+
+
+def test_agent1_reply_tolerates_malformed_commit_update():
+    empty = {
+        "root_cause": [],
+        "changes": [],
+        "tests": [],
+        "deferred": [],
+    }
+
+    partial = agent_loop._agent1_reply_from_value(
+        {
+            "status": "conclusion",
+            "message": "done",
+            "commit_message": "Fix bug",
+            "commit_update": {
+                "root_cause": "not a list",
+                "changes": None,
+                "tests": [1, 2],
+            },
+        }
+    )
+    assert partial.commit_update == {
+        "root_cause": [],
+        "changes": [],
+        "tests": ["1", "2"],
+        "deferred": [],
+    }
+
+    # A non-dict commit_update degrades to the four empty lists, never raises.
+    non_dict = agent_loop._agent1_reply_from_value(
+        {
+            "status": "conclusion",
+            "message": "done",
+            "commit_message": "Fix bug",
+            "commit_update": ["nope"],
+        }
+    )
+    assert non_dict.commit_update == empty
+
+
+def test_agent1_reply_commit_update_default_is_not_shared():
+    first = agent_loop.Agent1Reply("conclusion", "a", "Fix a")
+    second = agent_loop.Agent1Reply("conclusion", "b", "Fix b")
+
+    assert first.commit_update is not second.commit_update
+    first.commit_update["changes"].append("mutated")
+    assert second.commit_update["changes"] == []
+
+
 def test_work_queue_skips_task_after_dispute_limit_and_continues(
     repo: Path,
     tmp_path: Path,
