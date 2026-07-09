@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 import sys
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
@@ -182,6 +183,49 @@ def test_codex_reviewer_prompt_checks_big_picture_fit(repo: Path, tmp_path: Path
     assert "Does this diff address the user's actual request" in prompt
     assert "For docs, plans, runbooks, and migrations" in prompt
     assert "Do not limit findings to lines changed" in prompt
+
+
+def test_codex_reviewer_prompt_is_code_only(repo: Path, tmp_path: Path):
+    fake_codex = tmp_path / "fake_codex.py"
+    captured_prompt = tmp_path / "prompt.txt"
+    fake_codex.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"open({str(captured_prompt)!r}, 'w').write(sys.argv[-1])\n"
+        "out = sys.argv[sys.argv.index('--output-last-message') + 1]\n"
+        "open(out, 'w').write(json.dumps({'status':'clean','summary':'ok','issues':[]}))\n"
+    )
+    fake_codex.chmod(0o755)
+
+    reviewer = agent_loop.CodexReviewer(
+        executable=str(fake_codex),
+        repo=repo,
+        model=None,
+    )
+    reviewer.review(
+        base_commit="base",
+        commit="head",
+        agent1_conclusion="Updated the code.",
+    )
+
+    prompt = captured_prompt.read_text()
+    # Normalize wrapping so the assertions guard wording, not source layout.
+    normalized = " ".join(prompt.split())
+    # The scope carve-out targets commit metadata only; it must not shrink the
+    # review to "code only" and drop docs/plans/migration artifacts.
+    assert (
+        "Review repository changes only; do not comment on commit messages "
+        "or add commit facts." in normalized
+    )
+    assert "Review code only" not in normalized
+    # Broader review requirements survive the carve-out.
+    assert "docs, plans, runbooks, and migrations" in normalized
+
+    # Normal review stays free of commit-message fields.
+    assert "commit" not in agent_loop.REVIEW_SCHEMA["properties"]
+    assert "commit_message" not in agent_loop.REVIEW_SCHEMA["properties"]
+    review_fields = {f.name for f in fields(agent_loop.ReviewReply)}
+    assert review_fields == {"status", "summary", "issues"}
 
 
 def test_blocked_review_detection():

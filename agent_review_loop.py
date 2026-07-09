@@ -1427,6 +1427,9 @@ Review on two levels:
 Report only actionable findings. Do not limit findings to lines changed in the
 latest diff if the user's request requires reviewing the whole affected
 artifact. If no issue remains, return status="clean" with an empty issues array.
+
+Review repository changes only; do not comment on commit messages or add
+commit facts.
 """
         with tempfile.TemporaryDirectory(prefix="agent-review-") as tmp:
             tmp_path = Path(tmp)
