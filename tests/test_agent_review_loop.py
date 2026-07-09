@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import subprocess
 import sys
@@ -1651,6 +1652,167 @@ def test_work_queue_single_commit_is_not_summarized_or_amended(
     assert state.commit == head
     assert state.tasks[0]["status"] == "done"
     assert state.tasks[0]["last_commit"] == head
+
+
+class _SimulatedResumeCrash(Exception):
+    """Marks the simulated process interruption in the end-to-end resume test."""
+
+
+def test_end_to_end_squash_per_task_survives_resume(
+    repo: Path, tmp_path: Path, tmp_path_factory
+):
+    """End-to-end work-queue squash-per-task run that crashes and then resumes.
+
+    This is the T09 integration test. It drives the *whole* flow through the
+    real ``StateStore`` (JSON persistence to disk):
+
+        Agent 1 initial commit -> Agent 2 "issues" -> Agent 1 fix commit ->
+        Agent 2 "clean" -> persist phase="commit_summary" -> [simulated crash]
+        -> resume from disk -> Agent 2 commit summary -> squash.
+
+    It asserts only the end-to-end concerns the T01-T06 unit tests do not own:
+    that the accumulated ``task_commit_log`` survives the crash + reload intact,
+    and that the resumed run finishes as one commit whose message is the Agent 2
+    summary. Parsing (T01), schema/prompt text (T02), append round numbering
+    (T03), the code-only review prompt (T04), the summary method internals
+    (T05), and the fallback (T06) each have their own unit tests and are not
+    re-asserted here.
+    """
+    queue = tmp_path / "queue.md"
+    queue.write_text("- [ ] T01: fix one thing\n  Scope: tracked.txt only.\n")
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="e2e-resume",
+        work_queue=True,
+    )
+
+    agent = _TwoCommitAgent()
+    agent.repo = repo
+
+    class FlowReviewer:
+        def __init__(self):
+            self.review_calls = 0
+            self.summary_calls = 0
+            self.summary_log = None
+
+        def review(self, **_kwargs):
+            self.review_calls += 1
+            if self.review_calls == 1:
+                return agent_loop.ReviewReply(
+                    "issues",
+                    "One issue.",
+                    [{"severity": "medium", "title": "x", "details": "fix it"}],
+                )
+            return agent_loop.ReviewReply("clean", "No issues.", [])
+
+        def summarize_commit(
+            self, *, base_commit, head_commit, task_commit_log, recorded_tests
+        ):
+            self.summary_calls += 1
+            # Snapshot what the resumed summary pass actually received so the test
+            # can prove the preserved pre-crash log is *used*, not just persisted.
+            self.summary_log = copy.deepcopy(list(task_commit_log))
+            return agent_loop.CommitSummary(
+                "Summarize the whole task",
+                "Root cause: c1\n\nValidation: t2",
+            )
+
+    # The orchestrator's StateStore must live OUTSIDE the task repo. The `repo`
+    # fixture returns `tmp_path`, so a `tmp_path / "state"` store would write its
+    # JSON *inside* the git repo. Because the store is first written after
+    # `_new_state` snapshots `baseline_untracked`, `_commit_agent_changes` would
+    # treat `state/*.json` as agent-created files and sweep them into the
+    # squash-per-task commits — making the end-to-end assertions pass against
+    # orchestrator artifacts instead of the real production shape, where run logs
+    # live outside the task diff. A separate temp dir keeps the store out of range.
+    store_root = tmp_path_factory.mktemp("statestore")
+    inner = agent_loop.StateStore(store_root)
+
+    class CrashOnceStore:
+        """Real StateStore that crashes the first time it persists the crash-safe
+        ``commit_summary`` marker, modeling a process interruption between that
+        marker and the history-rewriting squash. The state is written to disk
+        before the crash, so a reload resumes from a consistent checkpoint."""
+
+        def __init__(self):
+            self.crashed = False
+
+        def save(self, value):
+            path = inner.save(value)
+            if value.phase == "commit_summary" and not self.crashed:
+                self.crashed = True
+                raise _SimulatedResumeCrash("crash after persisting commit_summary")
+            return path
+
+        def load(self, run_id):
+            return inner.load(run_id)
+
+    store = CrashOnceStore()
+    reviewer = FlowReviewer()
+
+    # First invocation: full issues -> fix -> clean sequence, then a crash right
+    # after phase="commit_summary" is persisted but before the squash lands.
+    with pytest.raises(_SimulatedResumeCrash):
+        agent_loop.run_state_loop(
+            state=state,
+            state_store=store,
+            run_log=_NoopLog(),
+            agent1=agent,
+            reviewer=reviewer,
+            max_rounds=3,
+            max_dispute_rounds=3,
+        )
+    assert reviewer.summary_calls == 0  # crashed before the summary pass ran
+
+    # Resume from persisted state: a fresh RunState deserialized from disk.
+    resumed = store.load(state.run_id)
+    assert resumed.phase == "commit_summary"
+    # Deep-copy a real snapshot: run_state_loop mutates `resumed` in place, so an
+    # alias of the live list would also mutate and mask an in-place clear/rewrite.
+    log_before_resume = copy.deepcopy(resumed.tasks[0]["task_commit_log"])
+    assert log_before_resume  # the pre-crash flow accumulated commit facts
+
+    class UnusedAgent:
+        def ask(self, _prompt):
+            raise AssertionError("resume must not re-invoke Agent 1")
+
+    result = agent_loop.run_state_loop(
+        state=resumed,
+        state_store=store,
+        run_log=_NoopLog(),
+        agent1=UnusedAgent(),
+        reviewer=reviewer,
+        max_rounds=3,
+        max_dispute_rounds=3,
+    )
+
+    assert result == 0
+    # The summary pass ran exactly once (on resume); review was not re-run.
+    assert reviewer.summary_calls == 1
+    assert reviewer.review_calls == 2
+    # The resumed summary pass was fed the intact pre-crash log (used, not just
+    # persisted) — compared against the immutable deep-copied snapshot.
+    assert reviewer.summary_log == log_before_resume
+    # The task converged to a single commit carrying the Agent 2 summary.
+    base = resumed.tasks[0]["task_base_commit"]
+    assert _git(repo, "rev-list", "--count", f"{base}..HEAD") == "1"
+    assert _git(repo, "log", "-1", "--format=%s", "HEAD") == "Summarize the whole task"
+    body = _git(repo, "log", "-1", "--format=%b", "HEAD")
+    assert "Root cause: c1" in body
+    assert "Validation: t2" in body
+    # The squashed task commit carries only the task's tracked change — never the
+    # orchestrator's StateStore artifacts. This guards the store staying outside
+    # the repo so the commit range reflects the real production shape (run logs
+    # ignored/outside the task diff) rather than committed orchestrator state.
+    committed = _git(repo, "diff", "--name-only", f"{base}..HEAD").splitlines()
+    assert committed == ["tracked.txt"]
+    # The commit log accumulated before the crash is preserved verbatim through
+    # the resume boundary and into the finished task's persisted state (compared
+    # against the immutable snapshot, not an alias of the mutated live list).
+    final = store.load(state.run_id)
+    assert final.tasks[0]["task_commit_log"] == log_before_resume
 
 
 def test_commit_summary_resume_never_re_squashes(repo: Path, tmp_path: Path):
