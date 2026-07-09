@@ -34,6 +34,18 @@ AGENT1_SCHEMA = {
         "work_branch": {"type": "string"},
         "review_base": {"type": "string"},
         "review_head": {"type": "string"},
+        # Optional append-only commit facts; every sub-array is optional so a
+        # reply may carry none, some, or all of the four fields.
+        "commit_update": {
+            "type": "object",
+            "properties": {
+                "root_cause": {"type": "array", "items": {"type": "string"}},
+                "changes": {"type": "array", "items": {"type": "string"}},
+                "tests": {"type": "array", "items": {"type": "string"}},
+                "deferred": {"type": "array", "items": {"type": "string"}},
+            },
+            "additionalProperties": False,
+        },
     },
     "required": ["status", "message", "commit_message"],
     "additionalProperties": False,
@@ -75,10 +87,18 @@ Return exactly the requested JSON object:
   continue. Put the question and useful context in message.
 - status="conclusion" when the current work is complete. Put a concise summary
   and test results in message, and provide a meaningful imperative git commit
-  subject in commit_message.
+  subject in commit_message. commit_message must be one imperative subject line
+  of at most 72 characters.
 - If you create or switch branches, include target_branch, work_branch,
   review_base, and review_head when known. review_base must be the commit Agent
   2 should diff from, not a stale branch from a previous task.
+
+You may also include commit_update: an append-only record of only the final,
+useful facts for the eventual commit message. It has four optional string
+arrays - root_cause, changes, tests, and deferred - and nothing else (there are
+no remove, replace, or dedup fields). Record durable facts only: no diffs, no
+logs, no file dumps. Each round only adds new facts; earlier rounds are kept as
+written, so do not restate facts you already recorded.
 
 When responding to reviewer feedback, assess every issue independently. Fix all
 issues you agree with and explain any disagreements in message. Do not make

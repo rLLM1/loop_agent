@@ -1203,6 +1203,70 @@ def test_agent1_reply_commit_update_default_is_not_shared():
     assert second.commit_update["changes"] == []
 
 
+def test_agent1_schema_commit_update_shape():
+    props = agent_loop.AGENT1_SCHEMA["properties"]
+    # commit_update is an optional (non-required) top-level field.
+    assert "commit_update" in props
+    assert "commit_update" not in agent_loop.AGENT1_SCHEMA["required"]
+
+    commit_update = props["commit_update"]
+    assert commit_update["type"] == "object"
+    assert commit_update["additionalProperties"] is False
+    assert set(commit_update["properties"]) == {
+        "root_cause",
+        "changes",
+        "tests",
+        "deferred",
+    }
+    for field_schema in commit_update["properties"].values():
+        assert field_schema == {"type": "array", "items": {"type": "string"}}
+
+
+def test_agent1_schema_validates_replies_with_and_without_commit_update():
+    jsonschema = pytest.importorskip("jsonschema")
+
+    without = {
+        "status": "conclusion",
+        "message": "done",
+        "commit_message": "Fix bug",
+    }
+    with_facts = {
+        **without,
+        "commit_update": {
+            "root_cause": ["null deref"],
+            "changes": ["guard input"],
+            "tests": ["unit: guard input"],
+            "deferred": [],
+        },
+    }
+
+    # Both shapes validate against the schema.
+    jsonschema.validate(without, agent_loop.AGENT1_SCHEMA)
+    jsonschema.validate(with_facts, agent_loop.AGENT1_SCHEMA)
+
+    # additionalProperties False still rejects unknown commit_update keys.
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            {**without, "commit_update": {"bogus": ["x"]}},
+            agent_loop.AGENT1_SCHEMA,
+        )
+
+
+def test_agent1_system_prompt_contains_commit_update_guidance():
+    system = agent_loop.AGENT1_SYSTEM
+    for expected in (
+        "commit_update",
+        "imperative subject line",
+        "72 characters",
+        "append-only",
+        "root_cause, changes, tests, and deferred",
+        "no remove, replace, or dedup",
+        "no diffs",
+        "at most 10 bullets",
+    ):
+        assert expected in system, expected
+
+
 def test_work_queue_skips_task_after_dispute_limit_and_continues(
     repo: Path,
     tmp_path: Path,
