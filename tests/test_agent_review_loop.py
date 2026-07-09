@@ -1203,6 +1203,251 @@ def test_agent1_reply_commit_update_default_is_not_shared():
     assert second.commit_update["changes"] == []
 
 
+def _reply_with_facts(commit_message, **facts):
+    return agent_loop.Agent1Reply(
+        "conclusion",
+        "done",
+        commit_message,
+        commit_update=agent_loop._normalize_commit_update(facts),
+    )
+
+
+def test_append_task_commit_log_numbers_rounds_by_log_length():
+    task = {"task_commit_log": []}
+
+    first = agent_loop._append_task_commit_log(
+        task, _reply_with_facts("Implement thing", changes=["c1"])
+    )
+    # review_round is still 1 in the real flow when the first fix commits, so
+    # round numbering must come from the log length, not review_round.
+    second = agent_loop._append_task_commit_log(
+        task, _reply_with_facts("Fix review finding", changes=["c2"])
+    )
+
+    assert first["round"] == 1
+    assert second["round"] == 2
+    log = task["task_commit_log"]
+    assert [entry["round"] for entry in log] == [1, 2]
+    assert log[0]["commit_message"] == "Implement thing"
+    assert log[1]["commit_message"] == "Fix review finding"
+    assert log[0]["changes"] == ["c1"]
+    assert log[1]["changes"] == ["c2"]
+
+
+def test_append_task_commit_log_initializes_missing_log():
+    task = {}
+    agent_loop._append_task_commit_log(task, _reply_with_facts("Subject"))
+    assert task["task_commit_log"][0]["round"] == 1
+    # A pre-existing non-list value is replaced with a fresh list.
+    task2 = {"task_commit_log": "corrupt"}
+    agent_loop._append_task_commit_log(task2, _reply_with_facts("Subject"))
+    assert task2["task_commit_log"][0]["round"] == 1
+
+
+def test_append_task_commit_log_preserves_duplicate_facts_verbatim():
+    task = {"task_commit_log": []}
+    facts = {"root_cause": ["same"], "changes": ["dup"], "tests": ["t"]}
+
+    agent_loop._append_task_commit_log(task, _reply_with_facts("Round one", **facts))
+    agent_loop._append_task_commit_log(task, _reply_with_facts("Round two", **facts))
+
+    log = task["task_commit_log"]
+    assert len(log) == 2
+    # No dedup or merge: identical facts are stored on both rounds.
+    assert log[0]["root_cause"] == log[1]["root_cause"] == ["same"]
+    assert log[0]["changes"] == log[1]["changes"] == ["dup"]
+    # Stored lists are independent copies, not shared references.
+    log[0]["changes"].append("mutated")
+    assert log[1]["changes"] == ["dup"]
+
+
+def test_start_work_queue_task_initializes_empty_commit_log(repo: Path, tmp_path: Path):
+    queue = tmp_path / "queue.md"
+    queue.write_text("- [ ] T01: do a thing\n  Scope: tracked.txt only.\n")
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="init-log",
+        work_queue=True,
+    )
+    # Seed a stale log to prove the start resets it.
+    state.tasks[0]["task_commit_log"] = [{"round": 9}]
+
+    agent_loop._start_work_queue_task(state, repo, 0)
+
+    assert state.tasks[0]["task_commit_log"] == []
+
+
+def test_task_commit_log_survives_state_save_load_round_trip(repo: Path, tmp_path: Path):
+    store = agent_loop.StateStore(tmp_path / "state")
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=None,
+    )
+    state.work_queue = True
+    state.current_task_index = 0
+    task = {"id": "T01", "title": "t", "text": "t", "status": "running"}
+    state.tasks = [task]
+    agent_loop._append_task_commit_log(task, _reply_with_facts("Round one", changes=["c1"]))
+    agent_loop._append_task_commit_log(task, _reply_with_facts("Round two", changes=["c1"]))
+    expected = list(task["task_commit_log"])
+
+    store.save(state)
+    loaded = store.load(state.run_id)
+
+    assert loaded.tasks[0]["task_commit_log"] == expected
+    assert [entry["round"] for entry in loaded.tasks[0]["task_commit_log"]] == [1, 2]
+
+
+def test_work_queue_commit_log_appends_one_entry_per_round(repo: Path, tmp_path: Path):
+    queue = tmp_path / "queue.md"
+    queue.write_text("- [ ] T01: fix one thing\n  Scope: tracked.txt only.\n")
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="commit-log-rounds",
+        work_queue=True,
+    )
+
+    class FakeAgent:
+        def __init__(self):
+            self.calls = 0
+
+        def ask(self, _prompt):
+            self.calls += 1
+            if self.calls == 1:
+                (repo / "tracked.txt").write_text("first\n")
+                return _reply_with_facts("Implement task", root_cause=["rc"], changes=["c1"])
+            (repo / "tracked.txt").write_text("fixed\n")
+            # Repeats changes=["c1"] to prove duplicates survive across rounds.
+            return _reply_with_facts("Fix finding", changes=["c1"], tests=["t2"])
+
+    class FakeReviewer:
+        def __init__(self):
+            self.calls = 0
+
+        def review(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return agent_loop.ReviewReply(
+                    "issues",
+                    "One issue.",
+                    [{"severity": "medium", "title": "x", "details": "fix it"}],
+                )
+            return agent_loop.ReviewReply("clean", "No issues.", [])
+
+    class CapturingStateStore:
+        def save(self, _value):
+            pass
+
+    class CapturingRunLog:
+        def add(self, _title, _text):
+            pass
+
+    result = agent_loop.run_state_loop(
+        state=state,
+        state_store=CapturingStateStore(),
+        run_log=CapturingRunLog(),
+        agent1=FakeAgent(),
+        reviewer=FakeReviewer(),
+        max_rounds=3,
+        max_dispute_rounds=3,
+    )
+
+    assert result == 0
+    log = state.tasks[0]["task_commit_log"]
+    # Two commit rounds -> exactly two entries numbered 1 then 2, even though
+    # review_round was still 1 when the fix commit appended (regression guard).
+    assert [entry["round"] for entry in log] == [1, 2]
+    assert log[0]["commit_message"] == "Implement task"
+    assert log[1]["commit_message"] == "Fix finding"
+    assert log[0]["changes"] == ["c1"]
+    assert log[1]["changes"] == ["c1"]
+    assert log[1]["tests"] == ["t2"]
+
+
+def test_commit_log_append_is_gated_behind_review_range_validation(
+    repo: Path, monkeypatch
+):
+    """Regression: the append must run *after* _validate_review_range.
+
+    When validation raises during the commit phase, the top-level handler saves
+    state at phase="commit" and a resume re-runs the whole commit block. The
+    append is the only non-idempotent mutation, so if it ran before validation
+    the round would be recorded twice on resume.
+    """
+    queue = repo / "queue.md"
+    queue.write_text("- [ ] T01: fix one thing\n  Scope: tracked.txt only.\n")
+    state = agent_loop._new_state(
+        repo=repo,
+        prompt="Implement queue",
+        problems_file=queue,
+        run_key="commit-log-validate-fail",
+        work_queue=True,
+    )
+    agent_loop._start_work_queue_task(state, repo, 0)
+    # Enter the commit phase directly, as if Agent 1 just returned a reply.
+    state.phase = "commit"
+    state.agent_mode = "initial"
+    state.reply = agent_loop.asdict(
+        _reply_with_facts("Implement task", changes=["c1"])
+    )
+
+    validate_calls = {"n": 0}
+    real_validate = agent_loop._validate_review_range
+
+    def flaky_validate(repo_arg, base, head):
+        validate_calls["n"] += 1
+        if validate_calls["n"] == 1:
+            raise agent_loop.OrchestrationError("review base is not an ancestor")
+        return real_validate(repo_arg, base, head)
+
+    monkeypatch.setattr(agent_loop, "_validate_review_range", flaky_validate)
+
+    class NoopStore:
+        def save(self, _value):
+            pass
+
+    class NoopLog:
+        def add(self, _title, _text):
+            pass
+
+    class StopReviewer:
+        # Halt the loop right after the commit phase so no second round runs.
+        def review(self, **_kwargs):
+            raise agent_loop.OrchestrationError("stop after commit")
+
+    def run_once():
+        return agent_loop.run_state_loop(
+            state=state,
+            state_store=NoopStore(),
+            run_log=NoopLog(),
+            agent1=object(),
+            reviewer=StopReviewer(),
+            max_rounds=3,
+            max_dispute_rounds=3,
+        )
+
+    # First pass: validation raises before the append, so nothing is logged and
+    # the phase stays at "commit" (what a resume would pick up).
+    with pytest.raises(agent_loop.OrchestrationError):
+        run_once()
+    assert state.tasks[0]["task_commit_log"] == []
+    assert state.phase == "commit"
+
+    # Resume: validation passes, the append runs exactly once, and the reviewer
+    # stop-guard halts before any second commit round -> exactly one entry.
+    with pytest.raises(agent_loop.OrchestrationError):
+        run_once()
+    log = state.tasks[0]["task_commit_log"]
+    assert [entry["round"] for entry in log] == [1]
+    assert log[0]["commit_message"] == "Implement task"
+    assert log[0]["changes"] == ["c1"]
+
+
 def test_agent1_schema_commit_update_shape():
     props = agent_loop.AGENT1_SCHEMA["properties"]
     # commit_update is an optional (non-required) top-level field.

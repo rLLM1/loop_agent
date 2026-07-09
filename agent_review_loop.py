@@ -758,6 +758,31 @@ def _extract_agent1_memory(reply: Agent1Reply, commit: Optional[str]) -> Dict[st
     return _normalize_task_memory(memory)
 
 
+def _append_task_commit_log(task: Dict[str, Any], reply: Agent1Reply) -> Dict[str, Any]:
+    """Append exactly one commit-round entry to the task's append-only log.
+
+    The round number is derived from the current log length, never from
+    ``review_round``: successive commit rounds are numbered 1, 2, 3... even when
+    the initial and first-fix commits both run while ``review_round`` is still 1
+    (it is incremented later in the commit phase). Facts are copied verbatim
+    from ``reply.commit_update`` with no merge, replace, or dedup, so duplicate
+    facts across rounds are preserved as written.
+    """
+    log = task.get("task_commit_log")
+    if not isinstance(log, list):
+        log = []
+        task["task_commit_log"] = log
+    commit_update = _normalize_commit_update(reply.commit_update)
+    entry: Dict[str, Any] = {
+        "round": len(log) + 1,
+        "commit_message": reply.commit_message,
+    }
+    for field_name in COMMIT_UPDATE_FIELDS:
+        entry[field_name] = list(commit_update[field_name])
+    log.append(entry)
+    return entry
+
+
 def _review_issue_memory(review: ReviewReply) -> List[str]:
     items = []
     for issue in review.issues[: TASK_MEMORY_LIMITS["open_review_findings"]]:
@@ -840,6 +865,7 @@ def _start_work_queue_task(state: RunState, repo: Path, index: int) -> None:
     task["task_base_commit"] = _git(repo, "rev-parse", "HEAD")
     task["review_round"] = 1
     task["last_commit"] = ""
+    task["task_commit_log"] = []
     task["task_memory"] = _normalize_task_memory(task.get("task_memory"))
     state.work_item_id = str(task.get("id"))
     state.work_item_title = str(task.get("title"))
@@ -2180,6 +2206,18 @@ def run_state_loop(
                     f"Agent 1 responded:\n{reply.message}"
                 )
                 state.review_round += 1
+            # Append-only per-round commit facts. The append is the one
+            # non-idempotent mutation in this phase, so it runs last: after
+            # _commit_agent_changes, review-range resolution, and
+            # _validate_review_range (all of which may raise OrchestrationError
+            # and trigger a save at phase="commit"). Placing it immediately
+            # before the phase transition + save means no fallible step sits
+            # between the append and the persist, so a crash-and-resume cannot
+            # duplicate a round. Round numbers derive from the log length, so
+            # the initial and first-fix commits get distinct rounds even though
+            # review_round is still 1 at the first-fix append.
+            if task is not None and state.commit:
+                _append_task_commit_log(task, reply)
             state.phase = "review"
             state_store.save(state)
             continue
