@@ -882,6 +882,65 @@ def _commit_summary_from_value(value: Dict[str, Any]) -> CommitSummary:
     )
 
 
+# Section labels for the deterministic fallback commit body. Each entry maps one
+# append-only commit_update field to a human-readable heading; the recorded facts
+# are copied verbatim (no dedup, no invention) as per-round bullets under their
+# section, in this order.
+_FALLBACK_COMMIT_SECTIONS = (
+    ("root_cause", "Root cause"),
+    ("changes", "Implementation notes"),
+    ("tests", "Validation"),
+    ("deferred", "Deferred"),
+)
+
+# Used only when no round recorded a non-empty commit subject, so the squash
+# still gets a non-empty message.
+_FALLBACK_COMMIT_SUBJECT = "Apply reviewed changes"
+
+
+def _fallback_commit_summary(
+    task_commit_log: Sequence[Dict[str, Any]],
+) -> CommitSummary:
+    """Build a commit summary from Agent 1 facts alone, no reviewer pass.
+
+    Used when the final Agent 2 commit-summary pass is unavailable. The subject
+    is the last non-empty ``commit_message`` recorded across rounds; the body is
+    a mechanical concatenation of every round's facts under fixed section labels,
+    each bullet tagged with its round. Nothing is deduped or invented, so an
+    empty or fact-free log still yields a safe non-empty subject.
+    """
+    entries = [
+        entry
+        for entry in (task_commit_log or [])
+        if isinstance(entry, dict)
+    ]
+
+    subject = ""
+    for entry in entries:
+        candidate = str(entry.get("commit_message") or "").strip()
+        if candidate:
+            subject = candidate
+    if not subject:
+        subject = _FALLBACK_COMMIT_SUBJECT
+
+    body_blocks: List[str] = []
+    for field_name, label in _FALLBACK_COMMIT_SECTIONS:
+        bullets: List[str] = []
+        for index, entry in enumerate(entries, start=1):
+            round_no = entry.get("round", index)
+            for item in entry.get(field_name) or []:
+                text = str(item).strip()
+                if text:
+                    bullets.append(f"- Round {round_no}: {text}")
+        if bullets:
+            body_blocks.append("\n".join([f"{label}:", *bullets]))
+
+    return CommitSummary(
+        final_commit_subject=subject,
+        final_commit_body="\n\n".join(body_blocks),
+    )
+
+
 def _review_issue_memory(review: ReviewReply) -> List[str]:
     items = []
     for issue in review.issues[: TASK_MEMORY_LIMITS["open_review_findings"]]:

@@ -1952,3 +1952,74 @@ def test_is_clean_review_marker_matches_only_synthetic_marker():
     assert agent_loop._is_clean_review_marker("Agent 2 review round 12: clean")
     assert not agent_loop._is_clean_review_marker("Agent 2 review round 1: issues")
     assert not agent_loop._is_clean_review_marker("pytest passed")
+
+
+def _commit_log_entry(round_no, commit_message="", **facts):
+    entry = {"round": round_no, "commit_message": commit_message}
+    for field_name in agent_loop.COMMIT_UPDATE_FIELDS:
+        entry[field_name] = list(facts.get(field_name, []))
+    return entry
+
+
+def test_fallback_commit_summary_subject_is_last_nonempty():
+    # A later empty subject must not override an earlier non-empty one; the
+    # subject is the last non-empty commit_message across all rounds.
+    log = [
+        _commit_log_entry(1, "Add parser"),
+        _commit_log_entry(2, "Refine parser edge cases"),
+        _commit_log_entry(3, ""),
+    ]
+
+    summary = agent_loop._fallback_commit_summary(log)
+
+    assert isinstance(summary, agent_loop.CommitSummary)
+    assert summary.final_commit_subject == "Refine parser edge cases"
+
+
+def test_fallback_commit_summary_body_labels_each_round_fact():
+    log = [
+        _commit_log_entry(
+            1,
+            "Add parser",
+            root_cause=["missing null guard"],
+            changes=["add guard in parse()"],
+            tests=["pytest -k parse"],
+        ),
+        _commit_log_entry(
+            2,
+            "Handle empty input",
+            changes=["return default on empty"],
+            deferred=["revisit unicode later"],
+        ),
+    ]
+
+    summary = agent_loop._fallback_commit_summary(log)
+    body = summary.final_commit_body
+
+    # Facts appear under their section labels, tagged with the source round,
+    # verbatim and without dedup or invention.
+    assert "Root cause:" in body
+    assert "- Round 1: missing null guard" in body
+    assert "Implementation notes:" in body
+    assert "- Round 1: add guard in parse()" in body
+    assert "- Round 2: return default on empty" in body
+    assert "Validation:" in body
+    assert "- Round 1: pytest -k parse" in body
+    assert "Deferred:" in body
+    assert "- Round 2: revisit unicode later" in body
+    # Sections with no facts are omitted entirely.
+    assert body.count("Root cause:") == 1
+
+
+def test_fallback_commit_summary_empty_log_has_safe_subject():
+    summary = agent_loop._fallback_commit_summary([])
+
+    assert summary.final_commit_subject
+    assert summary.final_commit_subject == agent_loop._FALLBACK_COMMIT_SUBJECT
+    assert summary.final_commit_body == ""
+
+    # A log whose only subjects are empty still yields the safe fallback subject.
+    only_empty = agent_loop._fallback_commit_summary(
+        [_commit_log_entry(1, ""), _commit_log_entry(2, "   ")]
+    )
+    assert only_empty.final_commit_subject == agent_loop._FALLBACK_COMMIT_SUBJECT
